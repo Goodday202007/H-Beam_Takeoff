@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environment variables
+.env
+
+# Backups & Temporary files
+backup/
+index_b*.html
+server_b*.py
+takeoff_analysis_b*.py
+takeoff_analysis_old*.py
+compare_*.py
+scratch/
+
+# Local Project Data & Output (Drawing files and Excel sheets)
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+*.pdf
+
+# IDE & Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS
+Thumbs.db
+desktop.ini
