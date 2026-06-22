@@ -109,6 +109,25 @@ async def save_meta(request: SaveMetaRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save metadata: {str(e)}")
 
 
+# API: 수동 추가된 시트 영역의 도면명 자동 추출
+class ExtractSheetNameRequest(BaseModel):
+    filename: str
+    bbox: List[float]
+
+@app.post("/api/extract_sheet_name")
+async def extract_sheet_name(request: ExtractSheetNameRequest):
+    file_path = os.path.join(DATA_DIR, request.filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Target DXF file not found.")
+    
+    try:
+        from takeoff_analysis import extract_sheet_name_from_bbox
+        result = extract_sheet_name_from_bbox(file_path, request.bbox)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract sheet name: {str(e)}")
+
+
 # API: 수동 추가된 시트 영역에 대한 부분 재분석 실행
 class AnalyzeSheetZoneRequest(BaseModel):
     filename: str
@@ -144,83 +163,72 @@ async def export_takeoff(request: ExportRequest):
     if not os.path.exists(dxf_path):
         raise HTTPException(status_code=404, detail="Original DXF file not found.")
 
-    # 전체 메타데이터 파일 로드하여 참조 시트용 원본 데이터 확보
+    # 전체 메타데이터 파일 로드하여 참조 시트용 원본 데이터 확보 + source 정보 보강
     all_sheets_dict = {}
     meta_path = dxf_path + ".meta.json"
+    meta_cols_by_id = {}
+    meta_beams_by_id = {}
     if os.path.exists(meta_path):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta_data = json.load(f)
                 all_sheets_dict = {s["id"]: s for s in meta_data.get("sheets", [])}
+                # id 기반 source 조회용 딕셔너리 생성
+                meta_cols_by_id = {c["id"]: c for c in meta_data.get("columns", []) if "id" in c}
+                meta_beams_by_id = {b["id"]: b for b in meta_data.get("beams", []) if "id" in b}
         except Exception as e:
             print(f"Failed to load meta file in export: {e}")
 
-    # 1. DXF 마킹 렌더링 파일 생성
-    marked_dxf_filename = request.filename.replace(".dxf", "_marked.dxf")
-    marked_dxf_path = os.path.join(OUTPUT_DIR, marked_dxf_filename)
+    # 디버그: 메타데이터 기둥 수 및 source 있는 기둥 수 확인
+    print(f"[DEBUG] 메타데이터 기둥 수: {len(meta_cols_by_id)}")
+    print(f"[DEBUG] 메타데이터에 source 있는 기둥: {sum(1 for c in meta_cols_by_id.values() if c.get('source'))}")
 
+    # request.columns/beams에 source 필드가 없는 경우 메타데이터에서 보강
+    for col in request.columns:
+        if not col.get("source"):
+            col_id = col.get("id", "")
+            meta_col = meta_cols_by_id.get(col_id)
+            if meta_col and meta_col.get("source"):
+                col["source"] = meta_col["source"]
+            else:
+                # id 매칭 실패 시 좌표 근사 매칭으로 source 복원
+                for mc in meta_cols_by_id.values():
+                    if mc.get("source") and mc.get("sheet_id") == col.get("sheet_id"):
+                        if abs(mc.get("cx", 0) - col.get("cx", 0)) < 1500 and abs(mc.get("cy", 0) - col.get("cy", 0)) < 1500:
+                            col["source"] = mc["source"]
+                            break
+        # height 필드가 없거나 0인 경우 메타데이터에서 보강
+        if not col.get("height"):
+            col_id = col.get("id", "")
+            meta_col = meta_cols_by_id.get(col_id)
+            if meta_col and meta_col.get("height"):
+                col["height"] = meta_col["height"]
+
+    for beam in request.beams:
+        if not beam.get("source"):
+            beam_id = beam.get("id", "")
+            meta_beam = meta_beams_by_id.get(beam_id)
+            if meta_beam and meta_beam.get("source"):
+                beam["source"] = meta_beam["source"]
+            else:
+                # id 매칭 실패 시 좌표 근사 매칭으로 source 복원
+                for mb in meta_beams_by_id.values():
+                    if mb.get("source") and mb.get("sheet_id") == beam.get("sheet_id"):
+                        b_start = beam.get("start", [0, 0])
+                        mb_start = mb.get("start", [0, 0])
+                        if abs(mb_start[0] - b_start[0]) < 2000 and abs(mb_start[1] - b_start[1]) < 2000:
+                            beam["source"] = mb["source"]
+                            break
+
+    # 디버그: AI 기둥/보 수 로그 출력
+    ai_col_cnt = sum(1 for c in request.columns if c.get("source") == "ai")
+    ai_beam_cnt = sum(1 for b in request.beams if b.get("source") == "ai")
+    both_beam_cnt = sum(1 for b in request.beams if b.get("source") == "both")
+    print(f"[EXPORT] 전체 기둥: {len(request.columns)}개, AI 기둥: {ai_col_cnt}개")
+    print(f"[EXPORT] 전체 보: {len(request.beams)}개, AI 보: {ai_beam_cnt}개, Both 보: {both_beam_cnt}개")
     
-    try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-        
-        # 기둥 및 보 마킹 전용 레이어 생성 (있으면 가져오고 없으면 생성)
-        try:
-            doc.layers.new(name="AUTO_MARK_COLUMNS", dxfattribs={'color': 2}) # 2 = Yellow
-        except ezdxf.DXFTableEntryError:
-            pass
-            
-        try:
-            doc.layers.new(name="AUTO_MARK_BEAMS", dxfattribs={'color': 4}) # 4 = Cyan
-        except ezdxf.DXFTableEntryError:
-            pass
-            
-        try:
-            doc.layers.new(name="AUTO_MARK_BEAMS_ENDS", dxfattribs={'color': 4})
-        except ezdxf.DXFTableEntryError:
-            pass
-        
-        # 기존 자동마킹 레이어에 있던 엔티티가 있다면 삭제하여 중복 방지
-        for ent in list(msp):
-            if ent.dxf.layer in ['AUTO_MARK_COLUMNS', 'AUTO_MARK_BEAMS', 'AUTO_MARK_BEAMS_ENDS']:
-                msp.delete_entity(ent)
-        
-        # 최종 기둥 렌더링 (속 찬 조그만 원형 점, 반지름 100mm = 직경 200mm)
-        for col in request.columns:
-            cx, cy = col["cx"], col["cy"]
-            hatch = msp.add_hatch(color=2, dxfattribs={'layer': 'AUTO_MARK_COLUMNS'})
-            hatch.paths.add_edge_path().add_arc((cx, cy), radius=100)
-            
-        # 최종 보 렌더링 (굵은 Cyan선 및 수직 엔드캡 틱 마크)
-        for beam in request.beams:
-            p1 = beam["start"]
-            p2 = beam["end"]
-            # 보 구조 중심선
-            msp.add_line(p1, p2, dxfattribs={'color': 4, 'layer': 'AUTO_MARK_BEAMS', 'lineweight': 35})
-            
-            # 틱 마크(수직 엔드캡) 렌더링
-            dx = p2[0] - p1[0]
-            dy = p2[1] - p1[1]
-            seg_len = math.sqrt(dx**2 + dy**2)
-            if seg_len > 0:
-                nx = -dy / seg_len
-                ny = dx / seg_len
-                tick_half = 200.0
-                
-                # 시작점 틱
-                tick_start_p1 = (p1[0] + nx * tick_half, p1[1] + ny * tick_half)
-                tick_start_p2 = (p1[0] - nx * tick_half, p1[1] - ny * tick_half)
-                msp.add_line(tick_start_p1, tick_start_p2, dxfattribs={'color': 4, 'layer': 'AUTO_MARK_BEAMS_ENDS', 'lineweight': 25})
-                
-                # 끝점 틱
-                tick_end_p1 = (p2[0] + nx * tick_half, p2[1] + ny * tick_half)
-                tick_end_p2 = (p2[0] - nx * tick_half, p2[1] - ny * tick_half)
-                msp.add_line(tick_end_p1, tick_end_p2, dxfattribs={'color': 4, 'layer': 'AUTO_MARK_BEAMS_ENDS', 'lineweight': 25})
-                
-        doc.saveas(marked_dxf_path)
-    except Exception as e:
-        print(f"Failed to generate marked DXF: {e}")
-        # 실패하더라도 엑셀 생성 프로세스는 진행하도록 함
+    # 1. DXF 마킹 렌더링 파일 생성 (생성 중지)
+    marked_dxf_filename = None
 
     # 2. 엑셀 적산 내역서 생성
     excel_filename = request.filename.replace(".dxf", "_takeoff.xlsx")
@@ -265,7 +273,7 @@ async def export_takeoff(request: ExportRequest):
     ws1.row_dimensions[1].height = 30
     
     # 요약 테이블 헤더 (규격 칼럼 추가)
-    headers_summary = ["부재 구분", "부재 부호", "H빔 규격 (상세정보)", "수량 (개/개소)", "총 길이 (m)", "단위 중량 (kg/m)", "총 중량 (ton)"]
+    headers_summary = ["부재 구분", "부재 부호", "H빔 규격 (상세정보)", "수량 (개/개소)", "총 길이 (mm)", "단위 중량 (ton/m)", "총 중량 (ton)"]
     ws1.append([]) # 빈 줄
     ws1.append(headers_summary)
     ws1.row_dimensions[3].height = 25
@@ -342,28 +350,31 @@ async def export_takeoff(request: ExportRequest):
         sheet_id = col.get("sheet_id")
         txt = col["text"].upper().strip()
         spec = get_spec_detail(sheet_id, txt)
-        h = float(col.get("height", 0)) / 1000.0 # mm -> m
+        h_mm = float(col.get("height", 0))  # mm 단위
         uw = get_hbeam_unit_weight(spec, txt, is_column=True)
         
         key = ("H빔 기둥", txt, spec)
         if key not in takeoff_summary:
-            takeoff_summary[key] = {"count": 0, "length": 0.0, "uw": uw}
+            takeoff_summary[key] = {"count": 0, "length_mm": 0.0, "uw": uw}
         takeoff_summary[key]["count"] += 1
-        takeoff_summary[key]["length"] += h
+        takeoff_summary[key]["length_mm"] += h_mm
 
     # 보 집계
+    # - source 없음: 규칙 기반 보 (중량 계산 포함)
+    # - source "both": 규칙 기반 보가 AI와 매칭됨 (중량 계산 포함)
+    # - source "ai": AI가 새로 발견한 보 (중량 계산 포함)
     for beam in request.beams:
         sheet_id = beam.get("sheet_id")
         txt = beam["text"].upper().strip()
         spec = get_spec_detail(sheet_id, txt)
-        l = float(beam.get("length", 0)) / 1000.0 # mm -> m
+        l_mm = float(beam.get("length", 0))  # mm 단위
         uw = get_hbeam_unit_weight(spec, txt, is_column=False)
         
         key = ("H빔 보", txt, spec)
         if key not in takeoff_summary:
-            takeoff_summary[key] = {"count": 0, "length": 0.0, "uw": uw}
+            takeoff_summary[key] = {"count": 0, "length_mm": 0.0, "uw": uw}
         takeoff_summary[key]["count"] += 1
-        takeoff_summary[key]["length"] += l
+        takeoff_summary[key]["length_mm"] += l_mm
 
     start_row = 4
     curr_row = start_row
@@ -378,16 +389,16 @@ async def export_takeoff(request: ExportRequest):
         kind, mark, spec = key
         data = takeoff_summary[key]
         cnt = data["count"]
-        length = data["length"]
+        length_mm = data["length_mm"]
         uw = data["uw"]
-        weight = cnt * length * uw / 1000.0 # ton
+        weight = (length_mm / 1000.0) * uw / 1000.0  # ton (mm → m → ton)
         
         total_count += cnt
-        total_length += length
+        total_length += length_mm
         total_uw += uw
         total_weight += weight
         
-        ws1.append([kind, mark, spec, cnt, round(length, 3), uw, round(weight, 3)])
+        ws1.append([kind, mark, spec, cnt, round(length_mm, 0), round(uw / 1000.0, 4), round(weight, 3)])
         curr_row += 1
         
     # 서식 적용
@@ -404,14 +415,14 @@ async def export_takeoff(request: ExportRequest):
                 if c == 4:
                     cell.number_format = '#,##0'
                 elif c == 5:
-                    cell.number_format = '#,##0.00'
+                    cell.number_format = '#,##0'
                 elif c == 6:
-                    cell.number_format = '#,##0.0'
+                    cell.number_format = '#,##0.0000'
                 elif c == 7:
                     cell.number_format = '#,##0.000'
 
     # 합계 행 추가 (수량, 총길이, 단위중량, 총중량에 대한 합계 적용)
-    ws1.append(["합계", "", "", total_count, round(total_length, 3), round(total_uw, 1), round(total_weight, 3)])
+    ws1.append(["합계", "", "", total_count, round(total_length, 0), round(total_uw / 1000.0, 4), round(total_weight, 3)])
     ws1.row_dimensions[curr_row].height = 22
     for c in range(1, 8):
         cell = ws1.cell(row=curr_row, column=c)
@@ -423,9 +434,9 @@ async def export_takeoff(request: ExportRequest):
             if c == 4:
                 cell.number_format = '#,##0'
             elif c == 5:
-                cell.number_format = '#,##0.00'
+                cell.number_format = '#,##0'
             elif c == 6:
-                cell.number_format = '#,##0.0'
+                cell.number_format = '#,##0.0000'
             elif c == 7:
                 cell.number_format = '#,##0.000'
         else:
@@ -439,8 +450,8 @@ async def export_takeoff(request: ExportRequest):
     ws2["A1"].font = font_title
     ws2.row_dimensions[1].height = 30
     
-    # H빔 규격 정보 칼럼 추가 (높이(m) 제거 및 중량 계산 조정)
-    headers_col = ["시트명", "부재 부호", "H빔 규격 (상세정보)", "수량 (개)", "설정 높이 (mm)", "단위 중량 (kg/m)", "중량 (kg)", "중심 좌표 X", "중심 좌표 Y"]
+    # H빔 규격 정보 칼럼 추가 (단위 통일: ton)
+    headers_col = ["시트명", "부재 부호", "H빔 규격 (상세정보)", "수량 (개)", "설정 높이 (mm)", "단위 중량 (ton/m)", "중량 (ton)", "중심 좌표 X", "중심 좌표 Y"]
     ws2.append([])
     ws2.append(headers_col)
     ws2.row_dimensions[3].height = 25
@@ -466,10 +477,11 @@ async def export_takeoff(request: ExportRequest):
         spec = get_spec_detail(sheet_id, txt)
         h_mm = float(col.get("height", 0))
         uw = get_hbeam_unit_weight(spec, txt, is_column=True)
-        weight = (h_mm / 1000.0) * uw
+        weight = (h_mm / 1000.0) * uw / 1000.0  # ton 단위 (종합집계표와 통일)
+        weight_rounded = round(weight, 3)  # 반올림된 값 (엑셀 표시와 동일)
         
         total_col_count += 1
-        total_col_weight += weight
+        total_col_weight += weight_rounded  # 반올림된 값 누적 (표시값 합계와 일치)
         
         ws2.append([
             sheet_name,
@@ -477,8 +489,8 @@ async def export_takeoff(request: ExportRequest):
             spec,
             1,
             h_mm,
-            uw,
-            round(weight, 1),
+            round(uw / 1000.0, 4),
+            weight_rounded,
             round(col["cx"], 1),
             round(col["cy"], 1)
         ])
@@ -496,14 +508,16 @@ async def export_takeoff(request: ExportRequest):
                 cell.alignment = Alignment(horizontal="right", vertical="center")
                 if c in [4, 5]:
                     cell.number_format = '#,##0'
-                elif c in [6, 7]:
-                    cell.number_format = '#,##0.0'
+                elif c == 6:
+                    cell.number_format = '#,##0.0000'
+                elif c == 7:
+                    cell.number_format = '#,##0.000'
                 elif c in [8, 9]:
                     cell.number_format = '#,##0'
  
-    # 기둥 합계 행 (높이(m) 제거로 열 개수 9개에 대응)
+    # 기둥 합계 행 (ton 단위, 종합집계표와 통일)
     if curr_row_col > start_row_col:
-        ws2.append(["합계", "", "", total_col_count, "", "", round(total_col_weight, 1), "", ""])
+        ws2.append(["합계", "", "", total_col_count, "", "", round(total_col_weight, 3), "", ""])
         ws2.row_dimensions[curr_row_col].height = 22
         for c in range(1, 10):
             cell = ws2.cell(row=curr_row_col, column=c)
@@ -515,7 +529,7 @@ async def export_takeoff(request: ExportRequest):
                 if c == 4:
                     cell.number_format = '#,##0'
                 else:
-                    cell.number_format = '#,##0.0'
+                    cell.number_format = '#,##0.000'
             else:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
@@ -528,7 +542,7 @@ async def export_takeoff(request: ExportRequest):
     ws3.row_dimensions[1].height = 30
     
     # H빔 규격 정보 칼럼 추가 (길이(m) 제거 및 중량 계산 조정)
-    headers_beam = ["시트명", "부재 부호", "H빔 규격 (상세정보)", "실측 길이 (mm)", "단위 중량 (kg/m)", "중량 (kg)", "시작점 X", "시작점 Y", "끝점 X", "끝점 Y"]
+    headers_beam = ["시트명", "부재 부호", "H빔 규격 (상세정보)", "실측 길이 (mm)", "단위 중량 (ton/m)", "중량 (ton)", "시작점 X", "시작점 Y", "끝점 X", "끝점 Y"]
     ws3.append([])
     ws3.append(headers_beam)
     ws3.row_dimensions[3].height = 25
@@ -552,18 +566,19 @@ async def export_takeoff(request: ExportRequest):
         spec = get_spec_detail(sheet_id, txt)
         l_mm = float(beam.get("length", 0))
         uw = get_hbeam_unit_weight(spec, txt, is_column=False)
-        weight = (l_mm / 1000.0) * uw
+        weight = (l_mm / 1000.0) * uw / 1000.0  # ton 단위 (종합집계표와 통일)
+        weight_rounded = round(weight, 3)  # 반올림된 값 (엑셀 표시와 동일)
         
         total_beam_length += l_mm
-        total_beam_weight += weight
+        total_beam_weight += weight_rounded  # 반올림된 값 누적 (표시값 합계와 일치)
         
         ws3.append([
             sheet_name,
             txt,
             spec,
             l_mm,
-            uw,
-            round(weight, 1),
+            round(uw / 1000.0, 4),
+            weight_rounded,
             round(beam["start"][0], 1),
             round(beam["start"][1], 1),
             round(beam["end"][0], 1),
@@ -583,12 +598,14 @@ async def export_takeoff(request: ExportRequest):
                 cell.alignment = Alignment(horizontal="right", vertical="center")
                 if c in [4, 7, 8, 9, 10]:
                     cell.number_format = '#,##0'
-                elif c in [5, 6]:
-                    cell.number_format = '#,##0.0'
+                elif c == 5:
+                    cell.number_format = '#,##0.0000'
+                elif c == 6:
+                    cell.number_format = '#,##0.000'
 
     # 보 합계 행 (길이(m) 제거로 열 개수 10개에 대응, 실측길이와 중량 합계 반영)
     if curr_row_beam > start_row_beam:
-        ws3.append(["합계", "", "", round(total_beam_length, 0), "", round(total_beam_weight, 1), "", "", "", ""])
+        ws3.append(["합계", "", "", round(total_beam_length, 0), "", round(total_beam_weight, 3), "", "", "", ""])
         ws3.row_dimensions[curr_row_beam].height = 22
         for c in range(1, 11):
             cell = ws3.cell(row=curr_row_beam, column=c)
@@ -600,7 +617,7 @@ async def export_takeoff(request: ExportRequest):
                 if c == 4:
                     cell.number_format = '#,##0'
                 else:
-                    cell.number_format = '#,##0.0'
+                    cell.number_format = '#,##0.000'
             else:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
@@ -721,8 +738,8 @@ async def export_takeoff(request: ExportRequest):
             Paragraph("<b>부재 부호</b>", header_style),
             Paragraph("<b>H빔 규격 (상세정보)</b>", header_style),
             Paragraph("<b>수량 (개)</b>", header_style),
-            Paragraph("<b>총 길이 (m)</b>", header_style),
-            Paragraph("<b>단위중량 (kg/m)</b>", header_style),
+            Paragraph("<b>총 길이 (mm)</b>", header_style),
+            Paragraph("<b>단위중량 (ton/m)</b>", header_style),
             Paragraph("<b>총 중량 (ton)</b>", header_style)
         ]]
         
@@ -734,12 +751,12 @@ async def export_takeoff(request: ExportRequest):
             kind, mark, spec = key
             data = takeoff_summary[key]
             cnt = data["count"]
-            length = data["length"]
+            length_mm = data["length_mm"]
             uw = data["uw"]
-            weight = cnt * length * uw / 1000.0 # ton
+            weight = (length_mm / 1000.0) * uw / 1000.0  # ton (mm → m → ton)
             
             total_count += cnt
-            total_length += length
+            total_length += length_mm
             total_weight += weight
             
             summary_table_data.append([
@@ -747,8 +764,8 @@ async def export_takeoff(request: ExportRequest):
                 Paragraph(mark, normal_style),
                 Paragraph(spec, normal_style),
                 Paragraph(f"{cnt:,}", normal_style),
-                Paragraph(f"{length:,.2f}", normal_style),
-                Paragraph(f"{uw:,.1f}", normal_style),
+                Paragraph(f"{length_mm:,.0f}", normal_style),
+                Paragraph(f"{uw / 1000.0:,.4f}", normal_style),
                 Paragraph(f"{weight:,.3f}", normal_style)
             ])
             
@@ -757,7 +774,7 @@ async def export_takeoff(request: ExportRequest):
             Paragraph("", normal_style),
             Paragraph("", normal_style),
             Paragraph(f"<b>{total_count:,}</b>", normal_style),
-            Paragraph(f"<b>{total_length:,.2f}</b>", normal_style),
+            Paragraph(f"<b>{total_length:,.0f}</b>", normal_style),
             Paragraph("", normal_style),
             Paragraph(f"<b>{total_weight:,.3f}</b>", normal_style)
         ])
@@ -821,10 +838,55 @@ async def export_takeoff(request: ExportRequest):
                     for col in sheet_cols:
                         cx, cy = col["cx"], col["cy"]
                         txt = col.get("text", "")
-                        d.add(PDFCircle(tx(cx), ty(cy), 3.5, fillColor=colors.HexColor('#F59E0B'), strokeColor=colors.white, strokeWidth=0.3))
-                        d.add(PDFString(tx(cx) + 4, ty(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#F59E0B')))
+                        col_source = col.get("source", "")
+                        is_ai = col_source == "ai"
+                        is_both = col_source == "both"
+                        
+                        if is_both:
+                            # Both 기둥: 룰베이스(속이 찬 원) + AI(속이 빈 원)
+                            d.add(PDFCircle(tx(cx), ty(cy), 3.5, fillColor=colors.HexColor('#F59E0B'), strokeColor=colors.white, strokeWidth=0.3))
+                            # AI 점선 원 (더 크게)
+                            ai_circle_r = 7.0
+                            ai_cx_pdf = tx(cx)
+                            ai_cy_pdf = ty(cy)
+                            num_segments = 12
+                            for i in range(num_segments):
+                                angle1 = 2 * math.pi * i / num_segments
+                                angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                x1_seg = ai_cx_pdf + ai_circle_r * math.cos(angle1)
+                                y1_seg = ai_cy_pdf + ai_circle_r * math.sin(angle1)
+                                x2_seg = ai_cx_pdf + ai_circle_r * math.cos(angle2)
+                                y2_seg = ai_cy_pdf + ai_circle_r * math.sin(angle2)
+                                d.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                            d.add(PDFString(tx(cx) + 4, ty(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                        elif is_ai:
+                            # AI 기둥: 속이 빈 핫핑크 점선 원 (더 크게)
+                            ai_circle_r = 7.0
+                            ai_cx_pdf = tx(cx)
+                            ai_cy_pdf = ty(cy)
+                            num_segments = 12
+                            for i in range(num_segments):
+                                angle1 = 2 * math.pi * i / num_segments
+                                angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                x1_seg = ai_cx_pdf + ai_circle_r * math.cos(angle1)
+                                y1_seg = ai_cy_pdf + ai_circle_r * math.sin(angle1)
+                                x2_seg = ai_cx_pdf + ai_circle_r * math.cos(angle2)
+                                y2_seg = ai_cy_pdf + ai_circle_r * math.sin(angle2)
+                                d.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                            d.add(PDFString(tx(cx) + 4, ty(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                        else:
+                            # 룰베이스 기둥: 속이 찬 원
+                            d.add(PDFCircle(tx(cx), ty(cy), 3.5, fillColor=colors.HexColor('#F59E0B'), strokeColor=colors.white, strokeWidth=0.3))
+                            d.add(PDFString(tx(cx) + 4, ty(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#F59E0B')))
                         
                     sheet_beams = [b for b in request.beams if b["sheet_id"] == sheet_id]
+                    
+                    # zoo guide: PDF 좌표 기준으로 보 그리기
+                    # 디버그: AI 보 확인
+                    ai_beams_in_sheet = [b for b in sheet_beams if b.get("source") == "ai"]
+                    both_beams_in_sheet = [b for b in sheet_beams if b.get("source") == "both"]
+                    print(f"[PDF] 시트 {sheet_id}: 전체 보 {len(sheet_beams)}개, AI 보 {len(ai_beams_in_sheet)}개, Both 보 {len(both_beams_in_sheet)}개")
+
                     for beam in sheet_beams:
                         start_pt = beam.get("start")
                         end_pt = beam.get("end")
@@ -832,14 +894,178 @@ async def export_takeoff(request: ExportRequest):
                         if start_pt and end_pt:
                             x1, y1 = start_pt
                             x2, y2 = end_pt
-                            d.add(PDFLine(tx(x1), ty(y1), tx(x2), ty(y2), strokeColor=colors.HexColor('#06B6D4'), strokeWidth=1.0))
-                            mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                            d.add(PDFString(tx(mx), ty(my) + 4, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#06B6D4')))
+                            beam_source = beam.get("source", "")
+                            is_ai = beam_source == "ai"
+                            is_both = beam_source == "both"
+                            
+                            if is_both:
+                                # Both 보: 룰베이스(하늘색 실선+속이찬 원) + AI(핫핑크 틱선+속이빈 원)
+                                # 1. 하늘색 실선 (룰베이스)
+                                d.add(PDFLine(tx(x1), ty(y1), tx(x2), ty(y2), strokeColor=colors.HexColor('#06B6D4'), strokeWidth=1.0))
+                                
+                                # 2. 핫핑크 틱선 (AI)
+                                dx = x2 - x1
+                                dy = y2 - y1
+                                seg_len = math.sqrt(dx**2 + dy**2)
+                                if seg_len > 0:
+                                    tick_w_pdf = 5.0
+                                    start_pdf_x = tx(x1)
+                                    start_pdf_y = ty(y1)
+                                    end_pdf_x = tx(x2)
+                                    end_pdf_y = ty(y2)
+                                    pdf_dx = end_pdf_x - start_pdf_x
+                                    pdf_dy = end_pdf_y - start_pdf_y
+                                    pdf_seg_len = math.sqrt(pdf_dx**2 + pdf_dy**2)
+                                    
+                                    if pdf_seg_len > 0:
+                                        pdf_nx = -pdf_dy / pdf_seg_len
+                                        pdf_ny = pdf_dx / pdf_seg_len
+                                        
+                                        # 시작 틱 (AI, 얇게: 1.0 → 0.7)
+                                        d.add(PDFLine(start_pdf_x + pdf_nx * tick_w_pdf, start_pdf_y + pdf_ny * tick_w_pdf,
+                                                    start_pdf_x - pdf_nx * tick_w_pdf, start_pdf_y - pdf_ny * tick_w_pdf,
+                                                    strokeColor=colors.HexColor('#FF007F'), strokeWidth=0.7))
+                                        # 끝 틱 (AI, 얇게: 1.0 → 0.7)
+                                        d.add(PDFLine(end_pdf_x + pdf_nx * tick_w_pdf, end_pdf_y + pdf_ny * tick_w_pdf,
+                                                    end_pdf_x - pdf_nx * tick_w_pdf, end_pdf_y - pdf_ny * tick_w_pdf,
+                                                    strokeColor=colors.HexColor('#FF007F'), strokeWidth=0.7))
+                                
+                                # 3. 중앙 원형 포인트: 룰베이스(속이 찬 하늘색 원) + AI(속이 빈 핫핑크 점선 원)
+                                mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                                # 룰베이스: 속이 찬 하늘색 원
+                                d.add(PDFCircle(tx(mx), ty(my), 3.5, fillColor=colors.HexColor('#06B6D4'), strokeColor=colors.white, strokeWidth=0.3))
+                                # AI: 속이 빈 핫핑크 점선 원 (기둥과 동일하게 크게)
+                                ai_circle_r = 7.0
+                                ai_cx_pdf = tx(mx)
+                                ai_cy_pdf = ty(my)
+                                num_segments = 12
+                                for i in range(num_segments):
+                                    angle1 = 2 * math.pi * i / num_segments
+                                    angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                    x1_seg = ai_cx_pdf + ai_circle_r * math.cos(angle1)
+                                    y1_seg = ai_cy_pdf + ai_circle_r * math.sin(angle1)
+                                    x2_seg = ai_cx_pdf + ai_circle_r * math.cos(angle2)
+                                    y2_seg = ai_cy_pdf + ai_circle_r * math.sin(angle2)
+                                    d.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                                d.add(PDFString(tx(mx), ty(my) + 4, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                                
+                            elif is_ai:
+                                # AI 승인 보: 전체 선 대신 양 끝단 핫핑크 직교 틱선 + 중앙 핫핑크 원형 포인트
+                                dx = x2 - x1
+                                dy = y2 - y1
+                                seg_len = math.sqrt(dx**2 + dy**2)
+                                if seg_len > 0:
+                                    nx = -dy / seg_len
+                                    ny = dx / seg_len
+                                    # tick_w = 150.0  # 월드 좌표 기준 150mm 반폭 틱
+                                    
+                                    # # 시작 틱
+                                    # d.add(PDFLine(tx(x1 + nx*tick_w), ty(y1 + ny*tick_w), tx(x1 - nx*tick_w), ty(y1 - ny*tick_w), strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.2))
+                                    # # 끝 틱
+                                    # d.add(PDFLine(tx(x2 + nx*tick_w), ty(y2 + ny*tick_w), tx(x2 - nx*tick_w), ty(y2 - ny*tick_w), strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.2))
+                                    
+                                    # zoo guide: PDF 좌표 기준으로 틱 크기 조정
+                                    # PDF 좌표로 변환 후, PDF 좌표 기준으로 8mm �반폭 틱 생성
+                                    # PDF 좌표 기준 틱 크기 (8mm)
+                                    tick_w_pdf = 5.0
+
+                                    # PDF 좌표로 변환
+                                    start_pdf_x = tx(x1)
+                                    start_pdf_y = ty(y1)
+                                    end_pdf_x = tx(x2)
+                                    end_pdf_y = ty(y2)
+
+                                    # PDF 좌표 기준 방향 벡터
+                                    pdf_dx = end_pdf_x - start_pdf_x
+                                    pdf_dy = end_pdf_y - start_pdf_y
+                                    pdf_seg_len = math.sqrt(pdf_dx**2 + pdf_dy**2)
+
+                                    if pdf_seg_len > 0:
+                                        pdf_nx = -pdf_dy / pdf_seg_len
+                                        pdf_ny = pdf_dx / pdf_seg_len
+                                        
+                                        # 시작 틱 (AI, 얇게: 1.0 → 0.7)
+                                        d.add(PDFLine(start_pdf_x + pdf_nx * tick_w_pdf, start_pdf_y + pdf_ny * tick_w_pdf,
+                                                    start_pdf_x - pdf_nx * tick_w_pdf, start_pdf_y - pdf_ny * tick_w_pdf,
+                                                    strokeColor=colors.HexColor('#FF007F'), strokeWidth=0.7))
+                                        # 끝 틱 (AI, 얇게: 1.0 → 0.7)
+                                        d.add(PDFLine(end_pdf_x + pdf_nx * tick_w_pdf, end_pdf_y + pdf_ny * tick_w_pdf,
+                                                    end_pdf_x - pdf_nx * tick_w_pdf, end_pdf_y - pdf_ny * tick_w_pdf,
+                                                    strokeColor=colors.HexColor('#FF007F'), strokeWidth=0.7))
+
+                                
+                                # 중앙 원형 포인트 (속이 빈 핫핑크 점선 원, 기둥과 동일하게 크게)
+                                mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                                ai_circle_r = 7.0
+                                ai_cx_pdf = tx(mx)
+                                ai_cy_pdf = ty(my)
+                                num_segments = 12
+                                for i in range(num_segments):
+                                    angle1 = 2 * math.pi * i / num_segments
+                                    angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                    x1_seg = ai_cx_pdf + ai_circle_r * math.cos(angle1)
+                                    y1_seg = ai_cy_pdf + ai_circle_r * math.sin(angle1)
+                                    x2_seg = ai_cx_pdf + ai_circle_r * math.cos(angle2)
+                                    y2_seg = ai_cy_pdf + ai_circle_r * math.sin(angle2)
+                                    d.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                                d.add(PDFString(tx(mx), ty(my) + 4, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                            else:
+                                # 일반 보(룰베이스): 하늘색 실선 + 속이 찬 하늘색 중앙 원
+                                d.add(PDFLine(tx(x1), ty(y1), tx(x2), ty(y2), strokeColor=colors.HexColor('#06B6D4'), strokeWidth=1.0))
+                                mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                                d.add(PDFCircle(tx(mx), ty(my), 3.5, fillColor=colors.HexColor('#06B6D4'), strokeColor=colors.white, strokeWidth=0.3))
+                                d.add(PDFString(tx(mx), ty(my) + 4, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#06B6D4')))
                             
                     # 도면 텍스트 및 선택한 수치 강조 그리기
                     t_texts = sheet.get("thumbnail_texts", []) or []
-                    h_vals = set(float(c.get("height", 0)) for c in request.columns if c.get("height"))
-                    h_vals.update(float(b.get("length", 0)) for b in request.beams if b.get("length"))
+                    
+                    # 현재 시트 기둥/보의 높이/길이 값을 AI/일반으로 분리하여 집계
+                    normal_h_vals = set()
+                    ai_h_vals = set()
+                    
+                    # 현재 시트 기둥 height 집계 (우선순위)
+                    for col in sheet_cols:
+                        h_val = col.get("height")
+                        if h_val:
+                            try:
+                                val = float(h_val)
+                                if val > 0:
+                                    if col.get("source") == "ai":
+                                        ai_h_vals.add(val)
+                                    else:
+                                        normal_h_vals.add(val)
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # 현재 시트 보 length 집계
+                    for beam in sheet_beams:
+                        l_val = beam.get("length")
+                        if l_val:
+                            try:
+                                val = float(l_val)
+                                if val > 0:
+                                    if beam.get("source") == "ai":
+                                        ai_h_vals.add(val)
+                                    else:
+                                        normal_h_vals.add(val)
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # 다른 시트 값도 포함 (현재 시트에 없는 경우 fallback)
+                    for col in request.columns:
+                        if col.get("sheet_id") == sheet_id:
+                            continue  # 이미 위에서 처리됨
+                        h_val = col.get("height")
+                        if h_val:
+                            try:
+                                val = float(h_val)
+                                if val > 0:
+                                    if col.get("source") == "ai":
+                                        ai_h_vals.add(val)
+                                    else:
+                                        normal_h_vals.add(val)
+                            except (ValueError, TypeError):
+                                pass
                     
                     import re
                     for t in t_texts:
@@ -852,16 +1078,32 @@ async def export_takeoff(request: ExportRequest):
                         
                         if cx < -30 or cx > draw_w + 30 or cy < -30 or cy > draw_h + 30:
                             continue
+                        
+                        if not txt_str:
+                            continue
                             
                         clean = txt_str.strip()
-                        m_val = re.search(r'(\d+)', clean.replace(",", ""))
-                        is_selected_val = False
-                        if m_val:
-                            val = float(m_val.group(1))
-                            if val in h_vals:
-                                is_selected_val = True
+                        # 쉼표 제거 후 숫자 추출 (정수 1000~20000 범위만 유효 높이/길이로 판단)
+                        clean_no_comma = clean.replace(",", "")
+                        nums_found = re.findall(r'\b(\d{4,6})\b', clean_no_comma)
+                        
+                        is_ai_val = False
+                        is_normal_val = False
+                        for num_str in nums_found:
+                            try:
+                                val = float(num_str)
+                                if val in ai_h_vals:
+                                    is_ai_val = True
+                                    break
+                                elif val in normal_h_vals:
+                                    is_normal_val = True
+                            except (ValueError, TypeError):
+                                pass
                                 
-                        if is_selected_val:
+                        if is_ai_val:
+                            # AI 관련 높이/수치는 핫핑크색으로 강조
+                            d.add(PDFString(cx, cy, txt_str, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                        elif is_normal_val:
                             d.add(PDFString(cx, cy, txt_str, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#F59E0B')))
                         else:
                             d.add(PDFString(cx, cy, txt_str, fontName=font_name, fontSize=5, fillColor=colors.Color(148/255.0, 163/255.0, 184/255.0, 0.6)))
@@ -915,19 +1157,73 @@ async def export_takeoff(request: ExportRequest):
                             for col in ref_cols:
                                 cx, cy = col["cx"], col["cy"]
                                 txt = col.get("text", "")
-                                d_ref.add(PDFCircle(tx_ref(cx), ty_ref(cy), 3.5, fillColor=colors.HexColor('#F59E0B'), strokeColor=colors.white, strokeWidth=0.3))
-                                d_ref.add(PDFString(tx_ref(cx) + 4, ty_ref(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#F59E0B')))
+                                col_source = col.get("source", "")
+                                is_ai = col_source == "ai"
+                                is_both = col_source == "both"
                                 
-                            # 높이 텍스트 강조 그리기
+                                if is_both:
+                                    d_ref.add(PDFCircle(tx_ref(cx), ty_ref(cy), 3.5, fillColor=colors.HexColor('#F59E0B'), strokeColor=colors.white, strokeWidth=0.3))
+                                    # AI 점선 원 (더 크게)
+                                    ai_circle_r = 7.0
+                                    ai_cx_pdf = tx_ref(cx)
+                                    ai_cy_pdf = ty_ref(cy)
+                                    num_segments = 12
+                                    for i in range(num_segments):
+                                        angle1 = 2 * math.pi * i / num_segments
+                                        angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                        x1_seg = ai_cx_pdf + ai_circle_r * math.cos(angle1)
+                                        y1_seg = ai_cy_pdf + ai_circle_r * math.sin(angle1)
+                                        x2_seg = ai_cx_pdf + ai_circle_r * math.cos(angle2)
+                                        y2_seg = ai_cy_pdf + ai_circle_r * math.sin(angle2)
+                                        d_ref.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                                    d_ref.add(PDFString(tx_ref(cx) + 4, ty_ref(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                                elif is_ai:
+                                    # AI 기둥: 속이 빈 핫핑크 점선 원 (더 크게)
+                                    ai_circle_r = 7.0
+                                    ai_cx_pdf = tx_ref(cx)
+                                    ai_cy_pdf = ty_ref(cy)
+                                    num_segments = 12
+                                    for i in range(num_segments):
+                                        angle1 = 2 * math.pi * i / num_segments
+                                        angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                        x1_seg = ai_cx_pdf + ai_circle_r * math.cos(angle1)
+                                        y1_seg = ai_cy_pdf + ai_circle_r * math.sin(angle1)
+                                        x2_seg = ai_cx_pdf + ai_circle_r * math.cos(angle2)
+                                        y2_seg = ai_cy_pdf + ai_circle_r * math.sin(angle2)
+                                        d_ref.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                                    d_ref.add(PDFString(tx_ref(cx) + 4, ty_ref(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#FF007F')))
+                                else:
+                                    d_ref.add(PDFCircle(tx_ref(cx), ty_ref(cy), 3.5, fillColor=colors.HexColor('#F59E0B'), strokeColor=colors.white, strokeWidth=0.3))
+                                    d_ref.add(PDFString(tx_ref(cx) + 4, ty_ref(cy) - 3.5, txt, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#F59E0B')))
+                                
+                            # 높이 텍스트 강조 그리기 (참조 도면)
                             ref_texts = ref_sheet.get("thumbnail_texts", []) or []
                             sheet_cols_for_h = [c for c in request.columns if c["sheet_id"] == sheet_id]
-                            h_vals = set(float(c.get("height", 0)) for c in sheet_cols_for_h if c.get("height"))
+                            
+                            ref_normal_h_vals = set()
+                            ref_ai_h_vals = set()
+                            for c in sheet_cols_for_h:
+                                h_val = c.get("height")
+                                if h_val:
+                                    try:
+                                        val = float(h_val)
+                                        if val > 0:
+                                            col_source = c.get("source", "")
+                                            if col_source == "ai" or col_source == "both":
+                                                ref_ai_h_vals.add(val)
+                                            else:
+                                                ref_normal_h_vals.add(val)
+                                    except (ValueError, TypeError):
+                                        pass
                             
                             import re
                             for t in ref_texts:
                                 tx_val = float(t.get("x", 0))
                                 ty_val = float(t.get("y", 0))
                                 txt_str = t.get("text", "")
+                                
+                                if not txt_str:
+                                    continue
                                 
                                 cx = tx_ref(tx_val)
                                 cy = ty_ref(ty_val)
@@ -936,15 +1232,40 @@ async def export_takeoff(request: ExportRequest):
                                     continue
                                     
                                 clean = txt_str.strip()
-                                m_val = re.search(r'(\d+)', clean.replace(",", ""))
-                                is_selected_val = False
-                                if m_val:
-                                    val = float(m_val.group(1))
-                                    if val in h_vals:
-                                        is_selected_val = True
+                                clean_no_comma = clean.replace(",", "")
+                                nums_found = re.findall(r'\b(\d{4,6})\b', clean_no_comma)
+                                is_ai_val = False
+                                is_normal_val = False
+                                for num_str in nums_found:
+                                    try:
+                                        val = float(num_str)
+                                        if val in ref_ai_h_vals:
+                                            is_ai_val = True
+                                            break
+                                        elif val in ref_normal_h_vals:
+                                            is_normal_val = True
+                                    except (ValueError, TypeError):
+                                        pass
                                         
-                                if is_selected_val:
-                                    d_ref.add(PDFString(cx, cy, txt_str, fontName=bold_font_name, fontSize=8, fillColor=colors.HexColor('#F59E0B')))
+                                if is_ai_val:
+                                    # AI 높이 텍스트: 핫핑크 진하게 + 글씨를 포함하는 점선 동그라미
+                                    # 텍스트 길이에 따라 동그라미 크기 조정
+                                    text_len = len(txt_str)
+                                    circle_r = max(10.0, text_len * 2.5 + 5.0)
+                                    # 점선 원 그리기
+                                    num_segments = 12
+                                    for i in range(num_segments):
+                                        angle1 = 2 * math.pi * i / num_segments
+                                        angle2 = 2 * math.pi * (i + 0.6) / num_segments
+                                        x1_seg = cx + circle_r * math.cos(angle1)
+                                        y1_seg = cy + circle_r * math.sin(angle1)
+                                        x2_seg = cx + circle_r * math.cos(angle2)
+                                        y2_seg = cy + circle_r * math.sin(angle2)
+                                        d_ref.add(PDFLine(x1_seg, y1_seg, x2_seg, y2_seg, strokeColor=colors.HexColor('#FF007F'), strokeWidth=1.0))
+                                    d_ref.add(PDFString(cx, cy, txt_str, fontName=bold_font_name, fontSize=10, fillColor=colors.HexColor('#FF007F')))
+                                elif is_normal_val:
+                                    # 룰베이스 높이 텍스트: 주황색 진하게
+                                    d_ref.add(PDFString(cx, cy, txt_str, fontName=bold_font_name, fontSize=10, fillColor=colors.HexColor('#F59E0B')))
                                 else:
                                     d_ref.add(PDFString(cx, cy, txt_str, fontName=font_name, fontSize=5, fillColor=colors.Color(148/255.0, 163/255.0, 184/255.0, 0.6)))
                                     
@@ -962,8 +1283,8 @@ async def export_takeoff(request: ExportRequest):
                 Paragraph("<b>부재 부호</b>", header_style),
                 Paragraph("<b>H빔 규격 (상세정보)</b>", header_style),
                 Paragraph("<b>길이/높이 (mm)</b>", header_style),
-                Paragraph("<b>단위중량 (kg/m)</b>", header_style),
-                Paragraph("<b>총 중량 (kg)</b>", header_style),
+                Paragraph("<b>단위중량 (ton/m)</b>", header_style),
+                Paragraph("<b>총 중량 (ton)</b>", header_style),
                 Paragraph("<b>X 좌표</b>", header_style),
                 Paragraph("<b>Y 좌표</b>", header_style)
             ]]
@@ -975,7 +1296,7 @@ async def export_takeoff(request: ExportRequest):
                 spec = get_spec_detail(sheet_id, txt)
                 h_mm = float(col.get("height", 0))
                 uw = get_hbeam_unit_weight(spec, txt, is_column=True)
-                weight = (h_mm / 1000.0) * uw
+                weight = (h_mm / 1000.0) * uw / 1000.0  # ton 단위
                 sheet_members.append({
                     "type": "기둥",
                     "text": txt,
@@ -992,7 +1313,7 @@ async def export_takeoff(request: ExportRequest):
                 spec = get_spec_detail(sheet_id, txt)
                 l_mm = float(beam.get("length", 0))
                 uw = get_hbeam_unit_weight(spec, txt, is_column=False)
-                weight = (l_mm / 1000.0) * uw
+                weight = (l_mm / 1000.0) * uw / 1000.0  # ton 단위
                 
                 # 보의 시작점 좌표
                 start_pt = beam.get("start", [0, 0])
@@ -1020,8 +1341,8 @@ async def export_takeoff(request: ExportRequest):
                     Paragraph(m["text"], normal_style),
                     Paragraph(m["spec"], normal_style),
                     Paragraph(f"{m['val']:,.0f}", normal_style),
-                    Paragraph(f"{m['uw']:,.1f}", normal_style),
-                    Paragraph(f"{m['weight']:,.1f}", normal_style),
+                    Paragraph(f"{m['uw'] / 1000.0:,.4f}", normal_style),
+                    Paragraph(f"{m['weight']:,.3f}", normal_style),
                     Paragraph(f"{m['x']:,.1f}", normal_style),
                     Paragraph(f"{m['y']:,.1f}", normal_style)
                 ])
@@ -1123,6 +1444,7 @@ async def ai_analyze_columns(request: AiHelperRequest):
         "4. 규칙 기반 알고리즘이 누락한(놓친) 기둥 단면이 있다면, DXF 데이터 상에서 적절한 기둥 텍스트를 찾아 새로 기둥으로 추가하라.\n"
         "5. 반드시 일람표(Schedule Table)에 명시되었거나 기존 기둥 리스트에 언급되었던 유효한 기둥 부호(symbol)만을 사용해야 한다. 존재하지 않는 임의의 부호를 새로 만들어내지 마라.\n"
         "6. 분석 결과는 반드시 JSON 포맷으로만 응답하라. 마크다운 기호(```json 등)나 기타 부연설명은 절대 포함하지 말고 순수 JSON만 응답해야 한다.\n\n"
+        "7. **중요**: 반환하는 cx, cy 좌표는 반드시 'column_candidates' 배열에 있는 기둥 단면(I자 형상 폴리선)의 중심 좌표여야 한다. 기둥 부호 텍스트(SC2, MC1 등)의 좌표를 반환하면 안 된다. 기둥 부호 텍스트는 기둥 단면과 떨어져 있을 수 있으므로, 텍스트 좌표가 아닌 실제 기둥 단면의 중심 좌표를 사용하라.\n\n"
         "반환 형식:\n"
         "{\n"
         '  "ai_columns": [\n'
@@ -1151,7 +1473,7 @@ async def ai_analyze_columns(request: AiHelperRequest):
             {"role": "user", "content": user_content}
         ],
         "response_format": {"type": "json_object"},
-        "max_tokens": 8192
+        "max_tokens": 16384
     }
     payload = sanitize_surrogates(payload)
 
@@ -1250,7 +1572,7 @@ async def ai_analyze_beams(request: AiHelperRequest):
             {"role": "user", "content": user_content}
         ],
         "response_format": {"type": "json_object"},
-        "max_tokens": 8192
+        "max_tokens": 16384
     }
     payload = sanitize_surrogates(payload)
 
@@ -1263,11 +1585,16 @@ async def ai_analyze_beams(request: AiHelperRequest):
             res_json = response.json()
             ai_message = res_json['choices'][0]['message']['content'].strip()
             
+            # 디버깅: AI 원본 응답 로깅
+            print(f"[DEBUG AI BEAM] 원본 응답 (처음 500자): {ai_message[:500]}")
+            
             try:
                 ai_data = json.loads(ai_message)
                 return ai_data
             except Exception as e:
+                print(f"[DEBUG AI BEAM] JSON 파싱 실패: {str(e)}")
                 cleaned_message = ai_message.replace("```json", "").replace("```", "").strip()
+                print(f"[DEBUG AI BEAM] 정리 후 응답 (처음 500자): {cleaned_message[:500]}")
                 return json.loads(cleaned_message)
 
     except Exception as e:
@@ -1331,21 +1658,24 @@ async def ai_recommend_height(request: AiHeightRequest):
     sys_prompt = (
         "너는 건축 구조 도면 및 단면도/입면도를 정밀하게 분석하여 기둥 층고(높이)를 추천하는 AI 엔지니어다.\n"
         "다음의 [규칙 참고서]를 준수하고, 도면에 있는 수치 텍스트 데이터에서 최적의 기둥 높이를 판단해야 한다.\n\n"
-        f"[규칙 참고서]\n{rules_ref}\n"
+        f"[규칙 참고서]\n{rules_ref}\n\n"
+        "[중요] 모든 응답은 반드시 한국어(한글)로만 작성해야 한다. 영어 사용 금지.\n"
     )
 
     user_content = (
         f"현재 분석 중인 도면 영역 ({sheet_name_to_log})에서 추출된 높이/수치 후보 텍스트 데이터:\n"
         f"{json.dumps(height_texts, ensure_ascii=False, indent=2)}\n\n"
         "분석 미션:\n"
-        "1. 도면 데이터에 나타난 치수선 값(type=dimension)이나 층고 텍스트(예: 3000, 3600, 3800, 4200, 4500, 5000 등) 중 **가장 크고 유효한(제일 긴) 기둥 높이값**을 찾으시오.\n"
+        "1. 도면 데이터에 나타난 치수선 값(type=dimension, direction=vertical)이나 층고 텍스트(예: 3000, 3600, 3800, 4200, 4500, 5000 등) 중 **가장 크고 유효한(제일 긴) 기둥 높이값**을 찾으시오.\n"
         "2. 일반적으로 층고 수치는 밀리미터(mm) 단위로 표현되며, 대개 2000mm ~ 15000mm 사이의 값을 가집니다.\n"
         "3. 만약 텍스트 중에 '1FL', '2FL', '3FL' 등의 레벨 차이 정보가 있고 이를 통해 산출 가능한 가장 큰 높이가 있다면 그것을 선택할 수도 있습니다.\n"
-        "4. 분석 결과는 반드시 JSON 포맷으로만 응답하며, 어떠한 마크다운 기호나 추가 설명도 배제하시오.\n\n"
+        "4. 분석 결과는 반드시 JSON 포맷으로만 응답하며, 어떠한 마크다운 기호나 추가 설명도 배제하시오.\n"
+        "5. reason 필드는 반드시 한국어(한글)로만 작성하시오. 영어 사용 절대 금지.\n\n"
+        "**중요 규칙**: 기둥 높이는 반드시 수직선(Vertical Line)의 치수만 사용해야 합니다. 수평선(Horizontal Line)의 길이는 기둥 높이로 인정하지 않습니다. direction='vertical'로 표시된 치수선만 기둥 높이 후보로 고려하십시오.\n\n"
         "반환 형식:\n"
         "{\n"
         '  "recommended_height": 제일 긴 기둥 높이값 (정수형 mm 단위, 예: 4200),\n'
-        '  "reason": "해당 높이를 도면에서 어떻게 도출했는지에 대한 자세한 한글 근거 설명"\n'
+        '  "reason": "해당 높이를 도면에서 어떻게 도출했는지에 대한 자세한 한글 근거 설명 (반드시 한국어로)"\n'
         "}"
     )
 
@@ -1360,7 +1690,7 @@ async def ai_recommend_height(request: AiHeightRequest):
             {"role": "user", "content": user_content}
         ],
         "response_format": {"type": "json_object"},
-        "max_tokens": 8192
+        "max_tokens": 16384
     }
     payload = sanitize_surrogates(payload)
 

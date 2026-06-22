@@ -201,9 +201,12 @@ def select_sheet_frame_for_anchor(doc_or_lines, anchor) -> Optional[Dict[str, An
         outer_box["is_inner"] = False
         return outer_box
 
-# 보 부호 정규식 매칭 패턴 (G, B, RG, RB, CG, CB, CRG, FG, FB, SBR, SG, SB, WG, VT, VG, MT, RSG, RSB, DS 등 - T 제외)
+# 보 부호 정규식 매칭 패턴
+# 첫 글자가 B 또는 G, 또는 두번째/세번째 글자에 B 또는 G가 있으면 보
+# 또는 MT, ST, RT, VT, WT, DT, NT, PT, LT, KT, HT, FT, CT, AT, ET, OT, UT, YT, ZT, QT, JT, XT + 숫자 패턴도 보로 인식
+# 예: G1, B1, MG1, RG1, CB1, FG1, SBR1, MT1, ST1, RT1, VT1 등
 BEAM_MARK_PATTERN = re.compile(
-    r'^(G|B|RG|RB|CG|CB|CRG|FG|FB|SBR|SG|SB|WG|VT|VG|MT|RSG|RSB|DS)\d+', 
+    r'^([A-Z]{0,2}[BG][A-Z]*\d+|[A-Z]T\d+)',
     re.IGNORECASE
 )
 
@@ -522,12 +525,41 @@ def parse_sheet_table(sheet_texts: List[Dict[str, Any]], bbox: List[float]) -> D
     registry = {}
     
     def is_valid_spec(spec_str: str) -> bool:
-        return bool(re.search(r'\d+\s*[xX*×]\s*\d+', spec_str))
+        # 앵글 규격(L로 시작)은 제외
+        cleaned = spec_str.strip().upper()
+        if cleaned.startswith('L') and len(cleaned) > 1 and cleaned[1] in ' \t-':
+            return False
         
-    # ── 1단계: 일람표 전용 레이어 체크 (process_all_dxf_v2.py 로직 완벽 이식) ──
+        # 1. H빔 B로 시작하는 규격은 제외 (예: B 100*200*2.3, B100*200*2.3)
+        if re.match(r'^B\s*\d+', cleaned):
+            return False
+        
+        # 2. 숫자 * 숫자만 있는 경우도 제외 (예: 700*1000) - H빔 규격이 아님
+        # 정확히 두 개의 숫자 사이에 * 또는 x 또는 × 만 있는 경우 (3개 이상은 허용)
+        if re.match(r'^\d+\s*[*xX×]\s*\d+$', cleaned):
+            return False
+        
+        # 기존 형식: 300x150x6.5x9, 300*150*6*9 등 3개 이상 숫자
+        if re.search(r'\d+\s*[xX*×]\s*\d+\s*[xX*×]\s*\d+', spec_str):
+            return True
+        # H빔 규격 형식:
+        # - 숫자 x 숫자 x 숫자 x 숫자 (예: 300x150x6.5x9, H300x150x6.5x9, H-300x150x6.5x9)
+        # - 숫자 x 숫자 x 숫자 / 숫자 (예: 250x125x6/9, H-250x125x6/9)
+        # - 앞에 H 또는 H-가 있을 수도 있고 없을 수도 있음
+        # - 구분자: x, X, *, × 모두 허용
+        # 공백과 하이픈을 제거하고 X 또는 /로 분리하여 모든 부분이 숫자인지 확인
+        cleaned2 = spec_str.replace(' ', '').replace('-', '').replace(',', '')
+        parts = re.split(r'[xX*×/]', cleaned2)
+        # 모든 부분이 숫자여야 함 (LENGTH 등 비숫자 포함 시 제외)
+        numeric_parts = [p for p in parts if p.replace('.', '').isdigit()]
+        if len(numeric_parts) >= 2 and len(numeric_parts) == len(parts):
+            return True
+        return False
+        
+    # ── 1단계: 일람표 전용 레이어 체크 (process_all_dxf_v2.py 로직 완벽 이식) ─
     table_layers = {
-        "TableText(Head)", "TableText(RowHead)", "TableText(Body)", 
-        "G-SCHD-TEXT", "Table(Main)"
+        "TableText(Head)", "TableText(RowHead)", "TableText(Body)",
+        "G-SCHD-TEXT", "Table(Main)", "TEX"
     }
     layer_texts = [t for t in sheet_texts if t.get('layer', '') in table_layers]
     
@@ -579,15 +611,84 @@ def parse_sheet_table(sheet_texts: List[Dict[str, Any]], bbox: List[float]) -> D
         if registry:
             return registry
             
-    # ── 2단계: 양방향 동적 앵커 파싱 (Fallback) ──
-    header_keywords = {"MARK", "부호", "마크", "MEMBER LIST", "MEMBERLIST", "MAT'L", "MATL", "규격", "SPEC"}
+    # ── 2단계: 일람표 헤더 키워드로 일람표 영역 감지 ──
+    header_keywords = {"MARK", "부호", "마크", "MEMBER LIST", "MEMBERLIST", "MAT'L", "MATL", "규격", "SPEC", "일람표", "부재일람표", "부재"}
     
-    anchors = []
+    header_anchors = []
     for t in sheet_texts:
         if t['text'].upper().strip().replace(" ", "") in header_keywords:
-            anchors.append(t)
+            header_anchors.append(t)
+    
+    # 헤더 기반 일람표 영역 감지 시도 (Y좌표 기반 - 일람표가 도면 하단에 있는 경우 대응)
+    # CAD 좌표계: Y가 위로 증가, 일람표 내용은 헤더보다 아래(더 작은 Y)에 위치
+    if header_anchors:
+        header_ys = [t['y'] for t in header_anchors]
+        # 일람표 영역: BBox 하단 ~ 헤더 Y좌표 위쪽, X는 전체 BBox
+        table_ymin = bbox[1]  # BBox 최하단 (가장 작은 Y)
+        table_ymax = max(header_ys) + 500.0  # 헤더 위쪽 약간 포함
+        table_xmin = bbox[0]
+        table_xmax = bbox[2]
+        
+        table_texts = []
+        for t in sheet_texts:
+            x, y = t['x'], t['y']
+            if table_xmin <= x <= table_xmax and table_ymin <= y <= table_ymax:
+                if t['text'].upper().strip().replace(" ", "") not in header_keywords:
+                    table_texts.append(t)
+        
+        if table_texts:
+            grouped = group_texts_by_y(table_texts, y_merge_tol=80.0)
+            for row in grouped:
+                row.sort(key=lambda z: z['x'])
+                cells = [t['text'].strip() for t in row if t['text'].strip()]
+                if len(cells) < 2:
+                    continue
+                    
+                mark_indices = []
+                for i, cell in enumerate(cells):
+                    if is_column_mark(cell) or is_beam_mark(cell) or is_brace_mark(cell) or is_material_mark(cell):
+                        mark_indices.append(i)
+                
+                if not mark_indices:
+                    continue
+                    
+                for k, idx in enumerate(mark_indices):
+                    next_idx = mark_indices[k+1] if k+1 < len(mark_indices) else len(cells)
+                    
+                    mark = cells[idx]
+                    detail = cells[idx+1] if idx+1 < next_idx else ""
+                    note = " ".join(cells[idx+2 : next_idx]) if idx+2 < next_idx else ""
+                    
+                    detail_clean = detail.strip()
+                    detail_words = detail_clean.split()
+                    if detail_words and all(is_column_mark(w) or is_beam_mark(w) for w in detail_words):
+                        continue
+                        
+                    if not any(char.isdigit() for char in detail):
+                        continue
+                    
+                    key = mark.upper().strip()
+                    if key not in EXCLUDE_MARKS and not is_material_mark(key) and key not in ["SCALE", "SPEC"]:
+                        if is_valid_spec(detail):
+                            if key in registry:
+                                old_detail = registry[key]['detail']
+                                if is_valid_spec(old_detail) and not is_valid_spec(detail):
+                                    continue
+                                elif not is_valid_spec(old_detail) and is_valid_spec(detail):
+                                    registry[key] = {'mark': mark, 'detail': detail, 'note': note}
+                                else:
+                                    continue
+                            else:
+                                registry[key] = {'mark': mark, 'detail': detail, 'note': note}
             
-    if not anchors:
+            if registry:
+                return registry
+    
+    # ── 3단계: 양방향 동적 앵커 파싱 (Fallback) ──
+    anchors = []
+    if header_anchors:
+        anchors = header_anchors
+    else:
         xs = [t['x'] for t in sheet_texts]
         ys = [t['y'] for t in sheet_texts]
         if xs and ys:
@@ -595,7 +696,7 @@ def parse_sheet_table(sheet_texts: List[Dict[str, Any]], bbox: List[float]) -> D
         else:
             anchors.append({'text': 'MARK', 'x': bbox[0], 'y': bbox[1]})
 
-    is_fallback = not bool([t for t in sheet_texts if t['text'].upper().strip().replace(" ", "") in header_keywords])
+    is_fallback = not bool(header_anchors)
 
     for a in anchors:
         ax, ay = a['x'], a['y']
@@ -603,7 +704,8 @@ def parse_sheet_table(sheet_texts: List[Dict[str, Any]], bbox: List[float]) -> D
         if is_fallback:
             table_window = (bbox[0], bbox[1], bbox[2], bbox[3])
         else:
-            table_window = (ax - 200.0, bbox[1], ax + 16000.0, bbox[3])
+            # 헤더 기반: X는 전체 BBox, Y는 헤더 아래쪽
+            table_window = (bbox[0], ay - 500.0, bbox[2], bbox[3])
         
         filtered_texts = []
         for t in sheet_texts:
@@ -1292,7 +1394,8 @@ def analyze_dxf_json(file_path):
                     s_texts.append({
                         'text': t['text'],
                         'x': tx,
-                        'y': ty
+                        'y': ty,
+                        'layer': t.get('layer', '')
                     })
                     if len(s_texts) >= 5000:
                         break
@@ -1315,14 +1418,59 @@ def analyze_dxf_json(file_path):
         if all_xs and all_ys:
             xmin, xmax = min(all_xs) - 1000, max(all_xs) + 1000
             ymin, ymax = min(all_ys) - 1000, max(all_ys) + 1000
+            fallback_bbox = [xmin, ymin, xmax, ymax]
+            
+            # 전체 선 데이터 수집 (최대 40000개)
+            fallback_lines = []
+            for l in lines:
+                fallback_lines.append({
+                    'start': l['start'],
+                    'end': l['end']
+                })
+                if len(fallback_lines) >= 40000:
+                    break
+            
+            # 폴리라인 세그먼트 추가
+            if len(fallback_lines) < 40000:
+                for poly in polylines:
+                    pts = poly['points']
+                    if not pts:
+                        continue
+                    for i in range(len(pts) - 1):
+                        fallback_lines.append({
+                            'start': [pts[i][0], pts[i][1]],
+                            'end': [pts[i+1][0], pts[i+1][1]]
+                        })
+                    if poly['is_closed'] and len(pts) > 2:
+                        fallback_lines.append({
+                            'start': [pts[-1][0], pts[-1][1]],
+                            'end': [pts[0][0], pts[0][1]]
+                        })
+                    if len(fallback_lines) >= 40000:
+                        break
+            
+            # 전체 텍스트 데이터 수집 (최대 5000개)
+            fallback_texts = []
+            for t in texts:
+                fallback_texts.append({
+                    'text': t['text'],
+                    'x': t['x'],
+                    'y': t['y']
+                })
+                if len(fallback_texts) >= 5000:
+                    break
+            
+            # 일람표 파싱
+            fallback_table = parse_sheet_table(texts, fallback_bbox)
+            
             detected_sheets.append({
                 'id': "sheet_1",
                 'number': "S-001",
                 'name': "전체 도면 시트",
-                'bbox': [xmin, ymin, xmax, ymax],
-                'thumbnail_lines': [],
-                'thumbnail_texts': [],
-                'schedule_table': {}
+                'bbox': fallback_bbox,
+                'thumbnail_lines': fallback_lines,
+                'thumbnail_texts': fallback_texts,
+                'schedule_table': fallback_table
             })
         else:
             detected_sheets.append({
@@ -2058,23 +2206,18 @@ def analyze_dxf_json(file_path):
                             'color': dim_color
                         })
             
-            # DIMENSION을 분해하여 녹색 선 수집
+            # DIMENSION을 분해하여 가이드선 수집
+            # DIMENSION 엔티티 내부의 선들은 기본적으로 모두 치수 보조선이므로, 색상이나 레이어 필터링 없이 수집
             for sub_entity in entity.virtual_entities():
                 if sub_entity.dxftype() == 'LINE':
-                    try:
-                        sub_color = sub_entity.dxf.color
-                    except:
-                        sub_color = dim_color
-                    
-                    if sub_color == 3:  # 녹색 선만 수집
-                        start = sub_entity.dxf.start
-                        end = sub_entity.dxf.end
-                        green_lines.append({
-                            'start': [start.x, start.y],
-                            'end': [end.x, end.y],
-                            'color': sub_color,
-                            'type': 'dimension_line'
-                        })
+                    start = sub_entity.dxf.start
+                    end = sub_entity.dxf.end
+                    green_lines.append({
+                        'start': [start.x, start.y],
+                        'end': [end.x, end.y],
+                        'color': 3,  # 프론트엔드에서 녹색 가이드선으로 렌더링되도록 3으로 통일
+                        'type': 'dimension_line'
+                    })
         except:
             pass
     
@@ -2088,6 +2231,56 @@ def analyze_dxf_json(file_path):
                 'type': 'line',
                 'layer': line.get('layer', '0')
             })
+    
+    # Defpoints 레이어의 선 수집 (출력되지 않는 보조선, 가이드선)
+    for line in lines:
+        layer = line.get('layer', '').upper()
+        if 'DEFPOINT' in layer:
+            green_lines.append({
+                'start': line['start'],
+                'end': line['end'],
+                'color': 7,
+                'type': 'defpoints_line',
+                'layer': line.get('layer', '0')
+            })
+    
+    # DIM/DEFPOINT 레이어의 선 수집 (치수선 가이드선)
+    # 일부 DXF 파일은 Defpoints 대신 DIM 레이어에 가이드선을 포함
+    # LINE 엔티티 수집
+    for line in lines:
+        layer = line.get('layer', '').upper()
+        if 'DIM' in layer or 'DEFPOINT' in layer:
+            green_lines.append({
+                'start': [float(line['start'][0]), float(line['start'][1])],
+                'end': [float(line['end'][0]), float(line['end'][1])],
+                'color': 3,  # 녹색으로 표시
+                'type': 'dim_guide_line',
+                'layer': layer
+            })
+    
+    # DIM/DEFPOINT 레이어의 LWPOLYLINE도 수집 (2점 폴리라인 = 선분)
+    for poly in polylines:
+        layer = poly.get('layer', '').upper()
+        if ('DIM' in layer or 'DEFPOINT' in layer) and not poly.get('is_closed', False) and poly.get('num_vertices', 0) >= 2:
+            pts = poly['points']
+            # 2점 폴리라인은 선분으로 취급
+            if len(pts) == 2:
+                green_lines.append({
+                    'start': [float(pts[0][0]), float(pts[0][1])],
+                    'end': [float(pts[1][0]), float(pts[1][1])],
+                    'color': 3,
+                    'type': 'dim_guide_polyline',
+                    'layer': layer
+                })
+            # 3점 이상 폴리라인은 첫점과 끝점을 연결
+            else:
+                green_lines.append({
+                    'start': [float(pts[0][0]), float(pts[0][1])],
+                    'end': [float(pts[-1][0]), float(pts[-1][1])],
+                    'color': 3,
+                    'type': 'dim_guide_polyline',
+                    'layer': layer
+                })
     
     # 높이 관련 텍스트 패턴 (6,000, 6000, 3,500 등)
     height_pattern = re.compile(r'^\d{1,2}[,\s]?\d{3}$')
@@ -2896,6 +3089,7 @@ def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
     """
     기둥 높이(층고) 분석을 위해, 지정된 bbox 영역 내부에서
     치수선 값 및 수치형 텍스트를 추출하여 압축 반환합니다.
+    Defpoints 레이어의 가이드선을 활용하여 수직/수평 방향을 판별합니다.
     """
     if not os.path.exists(file_path):
         return {"error": "File not found"}
@@ -2909,6 +3103,38 @@ def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
     x_min, y_min, x_max, y_max = bbox
 
     height_texts = []
+    
+    # 0. Defpoints 레이어의 LINE 엔티티 추출 (가이드선)
+    # Defpoints는 출력되지 않는 보조선으로, 치수선과 연결되어 방향 정보를 제공
+    defpoints_lines = []
+    for entity in msp.query("LINE"):
+        try:
+            layer = entity.dxf.layer.upper()
+            # Defpoints 레이어 또는 Defpoint로 시작하는 레이어
+            if 'DEFPOINT' in layer or layer == '0':
+                start = entity.dxf.start
+                end = entity.dxf.end
+                # BBox 내에 있는 선만 추출
+                cx = (start[0] + end[0]) / 2
+                cy = (start[1] + end[1]) / 2
+                if x_min <= cx <= x_max and y_min <= cy <= y_max:
+                    dx = abs(end[0] - start[0])
+                    dy = abs(end[1] - start[1])
+                    length = math.sqrt(dx**2 + dy**2)
+                    if length >= 100:  # 최소 100mm 이상
+                        # 수직선: X 방향 차이가 거의 없고 Y 방향 차이가 큰 경우
+                        is_vertical = (dx < 50 and dy > 100)
+                        # 수평선: Y 방향 차이가 거의 없고 X 방향 차이가 큰 경우
+                        is_horizontal = (dy < 50 and dx > 100)
+                        defpoints_lines.append({
+                            'start': (start[0], start[1]),
+                            'end': (end[0], end[1]),
+                            'is_vertical': is_vertical,
+                            'is_horizontal': is_horizontal,
+                            'layer': layer
+                        })
+        except Exception:
+            continue
     
     # 1. 일반 텍스트 및 치수 관련 수치 수집
     for entity in msp.query("TEXT MTEXT ATTRIB"):
@@ -2928,14 +3154,17 @@ def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
                         is_candidate = True
                         
                     if is_candidate:
+                        # 근처 Defpoints 선의 방향 확인
+                        direction = _find_nearby_defpoints_direction(pos.x, pos.y, defpoints_lines)
                         height_texts.append({
                             'text': txt,
                             'x': round(pos.x, 2),
                             'y': round(pos.y, 2),
-                            'layer': entity.dxf.layer
+                            'layer': entity.dxf.layer,
+                            'direction': direction
                         })
 
-    # 2. DIMENSION 엔티티로부터 값 추출
+    # 2. DIMENSION 엔티티로부터 값 추출 (수직선만)
     for entity in msp.query("DIMENSION"):
         try:
             txt = entity.dxf.get('text_override', '').strip()
@@ -2950,13 +3179,39 @@ def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
                 if 1000.0 <= val_num <= 100000.0:
                     pos = entity.dxf.text_midpoint
                     if x_min <= pos.x <= x_max and y_min <= pos.y <= y_max:
-                        height_texts.append({
-                            'text': txt,
-                            'x': round(pos.x, 2),
-                            'y': round(pos.y, 2),
-                            'layer': entity.dxf.layer,
-                            'type': 'dimension'
-                        })
+                        # 수직선(기둥 높이)만 추출 - 수평선 제외
+                        is_vertical = False
+                        
+                        # 방법 1: DIMENSION의 defpoint와 defpoint2로 방향 판별
+                        defpoint = entity.dxf.get('defpoint', None)
+                        defpoint2 = entity.dxf.get('defpoint2', None)
+                        if defpoint and defpoint2:
+                            dx = abs(defpoint2[0] - defpoint[0])
+                            dy = abs(defpoint2[1] - defpoint[1])
+                            if dy > dx:
+                                is_vertical = True
+                        else:
+                            # 방법 2: Defpoints 레이어의 가이드선으로 방향 판별
+                            direction = _find_nearby_defpoints_direction(pos.x, pos.y, defpoints_lines)
+                            if direction == 'vertical':
+                                is_vertical = True
+                            elif direction == 'horizontal':
+                                is_vertical = False
+                            else:
+                                # 방법 3: 텍스트 위치 기반으로 추정
+                                bbox_width = x_max - x_min
+                                if pos.x < x_min + bbox_width * 0.3 or pos.x > x_max - bbox_width * 0.3:
+                                    is_vertical = True
+                        
+                        if is_vertical:
+                            height_texts.append({
+                                'text': txt,
+                                'x': round(pos.x, 2),
+                                'y': round(pos.y, 2),
+                                'layer': entity.dxf.layer,
+                                'type': 'dimension',
+                                'direction': 'vertical'
+                            })
         except Exception:
             continue
 
@@ -2970,6 +3225,150 @@ def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
             unique_texts.append(item)
 
     return unique_texts
+
+
+def _find_nearby_defpoints_direction(x: float, y: float, defpoints_lines: List[Dict], search_radius: float = 500.0) -> str:
+    """
+    주어진 좌표 근처의 Defpoints 가이드선을 찾아 수직/수평 방향을 반환합니다.
+    """
+    vertical_count = 0
+    horizontal_count = 0
+    
+    for line in defpoints_lines:
+        # 선의 중심점 계산
+        cx = (line['start'][0] + line['end'][0]) / 2
+        cy = (line['start'][1] + line['end'][1]) / 2
+        
+        # 검색 반경 내에 있는지 확인
+        dist = math.sqrt((x - cx)**2 + (y - cy)**2)
+        if dist <= search_radius:
+            if line['is_vertical']:
+                vertical_count += 1
+            elif line['is_horizontal']:
+                horizontal_count += 1
+    
+    # 더 많은 방향을 반환
+    if vertical_count > horizontal_count:
+        return 'vertical'
+    elif horizontal_count > vertical_count:
+        return 'horizontal'
+    else:
+        return 'unknown'
+
+
+def extract_sheet_name_from_bbox(file_path: str, bbox: List[float]) -> Dict[str, str]:
+    """
+    지정된 BBox 영역 내의 텍스트를 분석하여 도면명을 자동 추출합니다.
+    수동 분할 시트 생성 시 도면명 추천에 사용됩니다.
+    """
+    if not os.path.exists(file_path):
+        return {"error": "File not found", "suggested_name": ""}
+
+    try:
+        doc = ezdxf.readfile(file_path, encoding='ascii')
+    except Exception as e:
+        return {"error": f"Failed to read DXF: {str(e)}", "suggested_name": ""}
+
+    msp = doc.modelspace()
+    x_min, y_min, x_max, y_max = bbox
+
+    # BBox 내 텍스트 수집
+    sheet_texts = []
+    for entity in msp.query("TEXT MTEXT ATTRIB"):
+        raw_txt = entity.dxf.text if entity.dxftype() != 'MTEXT' else entity.text
+        if raw_txt:
+            raw_txt = redecode_surrogates(raw_txt)
+            txt = clean_text(raw_txt)
+            if txt:
+                pos = entity.dxf.insert
+                if x_min <= pos.x <= x_max and y_min <= pos.y <= y_max:
+                    sheet_texts.append({
+                        'text': txt,
+                        'x': pos.x,
+                        'y': pos.y,
+                        'layer': entity.dxf.layer
+                    })
+
+    # INSERT 블록 내부 텍스트도 수집
+    block_texts = collect_insert_block_texts(doc, bbox)
+    sheet_texts.extend(block_texts)
+
+    if not sheet_texts:
+        return {"error": "No texts found in bbox", "suggested_name": ""}
+
+    # Y축 차이 100.0 이내의 텍스트들을 행(Row)별로 그룹화하여 합침
+    row_groups = group_texts_by_y(sheet_texts, y_merge_tol=100.0)
+    bbox_texts = []
+    for row in row_groups:
+        row.sort(key=lambda z: z['x'])
+        combined_txt = " ".join([t['text'].strip() for t in row if t['text'].strip()])
+        if combined_txt:
+            bbox_texts.append(combined_txt)
+
+    # 개별 텍스트 조각들도 후보로 등록
+    for t in sheet_texts:
+        t_strip = t['text'].strip()
+        if t_strip and t_strip not in bbox_texts:
+            bbox_texts.append(t_strip)
+
+    # 도면명 추출 (스코어링 방식)
+    best_name = None
+    best_score = -1
+
+    exclude_keywords = [
+        '주소', '위치', '남부로', '대지', '번지', '양산시', '도청', '협력', '감리',
+        '일자', '첨부', '주식회사', '공사명', '도면명', '일련번호',
+        '구 분', '부 호', '비 고', '크 기', '규 격', '단 면', '재 질', '수 량',
+        '구 분 부 호', '부 호 크 기', '크 기 비 고',
+        '도면번호', '도면 번호', '도면  번호',
+    ]
+
+    for txt_item in bbox_texts:
+        txt_clean = re.sub(r'[\s\(\)\[\]\<\>\{\}\:\,\=\-\_]+', ' ', txt_item).strip()
+        if not txt_clean:
+            continue
+        if not any('\uac00' <= char <= '\ud7a3' for char in txt_clean):
+            continue
+
+        if any(ek in txt_clean for ek in exclude_keywords):
+            continue
+        if any(ek in txt_clean.upper() for ek in [
+            'SCALE', 'DATE', 'PROJECT', 'TITLE', 'DWG', 'APPROVED',
+            'SHINDAE', 'TEL', 'FAX', 'SHEET NO', 'SHEETNO',
+            'CHANG WOO', 'ENGINEER', 'APPROVED BY', 'NAME OF DRAWING'
+        ]):
+            continue
+
+        score = 0
+        txt_pure = re.sub(r'[\s\(\)\[\]\<\>\{\}\:\,\=\-\_]+', '', txt_item)
+        if re.search(r'도\d+$', txt_pure):
+            score += 550
+        elif re.search(r'도$', txt_pure):
+            score += 500
+
+        if any(k in txt_clean for k in [
+            '구조도', '평면도', '주심도', '주심', '구조평면도', '일람표', '단면도', '설명도',
+            '기둥주심도', '기둥부호도', '부호도', '기둥일람표', '보일람표', '골조도', '배근도',
+            '구조 평면도', '기둥 주심도', '기둥 부호도'
+        ]):
+            score += 150
+
+        if '구조' in txt_clean and any(k in txt_clean for k in ['평면', '주심', '도면', '도']):
+            score += 50
+
+        length = len(txt_clean)
+        if 3 <= length <= 25:
+            score += (25 - length) * 0.5
+
+        if score > best_score:
+            best_score = score
+            best_name = txt_clean
+
+    if best_name and best_score > 30:
+        return {"suggested_name": best_name, "score": best_score}
+    else:
+        return {"suggested_name": "", "score": 0, "message": "적합한 도면명을 찾지 못했습니다."}
+
 
 if __name__ == "__main__":
     target_file = "도면1_sheet_01_S-301.dxf"

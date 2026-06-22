@@ -1593,6 +1593,7 @@
                         });
                     }
                     if (data.metadata.columns) {
+                        // 1. 기존 매칭 컬럼 복구 및 source 속성 복원
                         columns.forEach(newCol => {
                             const oldCol = data.metadata.columns.find(c => 
                                 c.sheet_id === newCol.sheet_id && 
@@ -1600,10 +1601,22 @@
                             );
                             if (oldCol) {
                                 newCol.height = oldCol.height || 0;
+                                if (oldCol.source) newCol.source = oldCol.source;
+                            }
+                        });
+                        // 2. 메타데이터에만 있는 신규 컬럼(AI 추가분 등) 복원
+                        data.metadata.columns.forEach(oldCol => {
+                            const hasMatch = columns.some(c => 
+                                c.sheet_id === oldCol.sheet_id && 
+                                Math.hypot(c.cx - oldCol.cx, c.cy - oldCol.cy) < 1500.0
+                            );
+                            if (!hasMatch) {
+                                columns.push(oldCol);
                             }
                         });
                     }
                     if (data.metadata.beams) {
+                        // 1. 기존 매칭 보 복구 및 source 속성 복원
                         beams.forEach(newBeam => {
                             const newCx = (newBeam.start[0] + newBeam.end[0]) / 2;
                             const newCy = (newBeam.start[1] + newBeam.end[1]) / 2;
@@ -1616,6 +1629,21 @@
                             if (oldBeam) {
                                 newBeam.text = oldBeam.text;
                                 if (oldBeam.length) newBeam.length = oldBeam.length;
+                                if (oldBeam.source) newBeam.source = oldBeam.source;
+                            }
+                        });
+                        // 2. 메타데이터에만 있는 신규 보(AI 추가분 등) 복원
+                        data.metadata.beams.forEach(oldBeam => {
+                            const oldCx = (oldBeam.start[0] + oldBeam.end[0]) / 2;
+                            const oldCy = (oldBeam.start[1] + oldBeam.end[1]) / 2;
+                            const hasMatch = beams.some(b => {
+                                if (b.sheet_id !== oldBeam.sheet_id) return false;
+                                const newCx = (b.start[0] + b.end[0]) / 2;
+                                const newCy = (b.start[1] + b.end[1]) / 2;
+                                return Math.hypot(oldCx - newCx, oldCy - newCy) < 2000.0;
+                            });
+                            if (!hasMatch) {
+                                beams.push(oldBeam);
                             }
                         });
                     }
@@ -2546,63 +2574,18 @@
             '                );',
             '                return inBbox;',
             '            });',
-            '            if (sheetGreenLines.length > 0) {',
-            '                ctx.strokeStyle = "#10b981";',
-            '                ctx.lineWidth = 1.0;',
-            '                ctx.setLineDash([6, 4]);',
-            '                ctx.beginPath();',
-            '                sheetGreenLines.forEach(function(line) {',
-            '                    ctx.moveTo(tx(line.start[0]), ty(line.start[1]));',
-            '                    ctx.lineTo(tx(line.end[0]), ty(line.end[1]));',
-            '                });',
-            '                ctx.stroke();',
-            '                ctx.setLineDash([]);',
-            '            }',
             '            var globalTextsData = opener && opener.globalTexts ? opener.globalTexts : [];',
-            '            console.log("[DEBUG] globalTextsData count:", globalTextsData.length);',
             '            var sheetHeightTexts = globalTextsData.filter(function(t) {',
             '                if (!t.type || (t.type !== "dimension" && t.type !== "height_text")) return false;',
             '                var txVal = Number(t.x), tyVal = Number(t.y);',
             '                return (txVal >= b[0] && txVal <= b[2] && tyVal >= b[1] && tyVal <= b[3]);',
             '            });',
-            '            console.log("[DEBUG] sheetHeightTexts count:", sheetHeightTexts.length);',
-            '            if (sheetHeightTexts.length > 0) {',
-            '                var fzHeight = Math.max(10, Math.min(16, vs.zoom * 450));',
-            '                ctx.font = "700 " + fzHeight + "px monospace";',
-            '                ctx.textAlign = "center";',
-            '                ctx.textBaseline = "middle";',
-            '                sheetHeightTexts.forEach(function(t) {',
-            '                    var txVal = Number(t.x), tyVal = Number(t.y);',
-            '                    var cx = tx(txVal), cy = ty(tyVal);',
-            '                    if (cx < -60 || cx > cv.width+60 || cy < -60 || cy > cv.height+60) return;',
-            '                    ctx.save();',
-            '                    ctx.fillStyle = t.type === "dimension" ? "#10b981" : "#22d3ee";',
-            '                    ctx.strokeStyle = "#000";',
-            '                    ctx.lineWidth = 2;',
-            '                    ctx.strokeText(t.text, cx, cy);',
-            '                    ctx.fillText(t.text, cx, cy);',
-            '                    ctx.restore();',
-            '                    var rawText = (t.text !== undefined && t.text !== null) ? String(t.text) : "";',
-            '                    var clean = rawText.trim();',
-            '                    var m = clean.replace(/,/g,"").match(/(-?\\d+)/);',
-            '                    if (m) {',
-            '                        var hv = Math.abs(parseInt(m[1]));',
-            '                        if (hv >= 100) {',
-            '                            var d = document.createElement("div");',
-            '                            d.className = "ref-marker";',
-            '                            var tw = Math.max(30, fzHeight * clean.length * 0.6 + 8);',
-            '                            d.style.cssText = "position:absolute;left:"+(cx-tw/2)+"px;top:"+(cy-fzHeight)+"px;width:"+tw+"px;height:"+(fzHeight*2)+"px;";',
-            '                            d.textContent = clean;',
-            '                            d.title = "높이로 선택: " + hv + "mm";',
-            '                            (function(hVal, cText) {',
-            '                                d.onclick = function(e) { e.stopPropagation(); selectH(hVal, cText); };',
-            '                            })(hv, clean);',
-            '                            mk.appendChild(d);',
-            '                            console.log("[DEBUG] Created ref-marker for green line value:", clean, "at (" + cx + "," + cy + ")");',
-            '                        }',
-            '                    }',
-            '                });',
-            '            }',
+            '            // sheetHeightTexts의 좌표를 Set으로 저장하여 중복 렌더링 방지',
+            '            var heightTextPositions = new Set();',
+            '            sheetHeightTexts.forEach(function(t) {',
+            '                var key = Math.round(t.x/10)*10 + "," + Math.round(t.y/10)*10;',
+            '                heightTextPositions.add(key);',
+            '            });',
             '            var txts = sheet.thumbnail_texts || [];',
             '            var fz = Math.max(8, Math.min(14, vs.zoom * 380));',
             '            ctx.textAlign = "center";',
@@ -2610,6 +2593,9 @@
             '            txts.forEach(function(t) {',
             '                var cx = tx(t.x), cy = ty(t.y);',
             '                if (cx < -60 || cx > cv.width+60 || cy < -60 || cy > cv.height+60) return;',
+            '                // sheetHeightTexts와 중복되는 위치는 건너뜀',
+            '                var key = Math.round(t.x/10)*10 + "," + Math.round(t.y/10)*10;',
+            '                if (heightTextPositions.has(key)) return;',
             '                ctx.save();',
             '                if (t.is_height_text) {',
             '                    var fzHeight = Math.max(12, Math.min(18, vs.zoom * 500));',
@@ -2645,11 +2631,63 @@
             '                    }',
             '                }',
             '            });',
-            '            if (txts.length === 0) {',
+            '            if (txts.length === 0 && sheetHeightTexts.length === 0) {',
             '                ctx.fillStyle = "rgba(100,116,139,0.5)";',
             '                ctx.font = "13px Inter,sans-serif";',
             '                ctx.textAlign = "center";',
             '                ctx.fillText("도면 텍스트 데이터가 없습니다", cv.width/2, cv.height/2);',
+            '            }',
+            '            // 높이 텍스트를 선 위에 렌더링',
+            '            if (sheetHeightTexts.length > 0) {',
+            '                var fzHeight = Math.max(10, Math.min(16, vs.zoom * 450));',
+            '                ctx.font = "700 " + fzHeight + "px monospace";',
+            '                ctx.textAlign = "center";',
+            '                ctx.textBaseline = "middle";',
+            '                sheetHeightTexts.forEach(function(t) {',
+            '                    var txVal = Number(t.x), tyVal = Number(t.y);',
+            '                    var cx = tx(txVal), cy = ty(tyVal);',
+            '                    if (cx < -60 || cx > cv.width+60 || cy < -60 || cy > cv.height+60) return;',
+            '                    ctx.save();',
+            '                    ctx.fillStyle = t.type === "dimension" ? "#10b981" : "#22d3ee";',
+            '                    ctx.strokeStyle = "#000";',
+            '                    ctx.lineWidth = 2;',
+            '                    ctx.strokeText(t.text, cx, cy);',
+            '                    ctx.fillText(t.text, cx, cy);',
+            '                    ctx.restore();',
+            '                    var rawText = (t.text !== undefined && t.text !== null) ? String(t.text) : "";',
+            '                    var clean = rawText.trim();',
+            '                    var m = clean.replace(/,/g,"").match(/(-?\\d+)/);',
+            '                    if (m) {',
+            '                        var hv = Math.abs(parseInt(m[1]));',
+            '                        if (hv >= 100) {',
+            '                            var d = document.createElement("div");',
+            '                            d.className = "ref-marker";',
+            '                            var tw = Math.max(30, fzHeight * clean.length * 0.6 + 8);',
+            '                            d.style.cssText = "position:absolute;left:"+(cx-tw/2)+"px;top:"+(cy-fzHeight)+"px;width:"+tw+"px;height:"+(fzHeight*2)+"px;";',
+            '                            d.textContent = clean;',
+            '                            d.title = "높이로 선택: " + hv + "mm";',
+            '                            (function(hVal, cText) {',
+            '                                d.onclick = function(e) { e.stopPropagation(); selectH(hVal, cText); };',
+            '                            })(hv, clean);',
+            '                            mk.appendChild(d);',
+            '                        }',
+            '                    }',
+            '                });',
+            '            }',
+            '            // 가이드 선을 HTML div 요소로 그려서 텍스트 마커와 같은 레이어에 배치',
+            '            if (sheetGreenLines.length > 0) {',
+            '                console.log("[DEBUG] Drawing", sheetGreenLines.length, "guide lines as HTML");',
+            '                sheetGreenLines.forEach(function(line, idx) {',
+            '                    var x1 = tx(line.start[0]), y1 = ty(line.start[1]);',
+            '                    var x2 = tx(line.end[0]), y2 = ty(line.end[1]);',
+            '                    console.log("[DEBUG] Line", idx, ":", x1.toFixed(1), y1.toFixed(1), "->", x2.toFixed(1), y2.toFixed(1));',
+            '                    var dx = x2 - x1, dy = y2 - y1;',
+            '                    var length = Math.sqrt(dx*dx + dy*dy);',
+            '                    var angle = Math.atan2(dy, dx) * 180 / Math.PI;',
+            '                    var d = document.createElement("div");',
+            '                    d.style.cssText = "position:absolute;left:"+x1+"px;top:"+y1+"px;width:"+length+"px;height:0px;transform-origin:0 0;transform:rotate("+angle+"deg);border-top:1.2px dashed rgba(16, 185, 129, 0.45);opacity:0.6;pointer-events:none;z-index:5;";',
+            '                    mk.appendChild(d);',
+            '                });',
             '            }',
             '        }',
             '',
@@ -2881,12 +2919,17 @@
     }
 
     // 기둥 워크스페이스 (Canvas 기반)
-    // H빔 기둥 마커 그리기 (H형 형상 중앙에 속이 찬 조그만 동그라미 표시)
-    function drawCircleMarker(ctx, cx, cy, size, color, mapped, isSelected) {
+    // H빔 기둥/보 마커 그리기
+    // source 파라미터에 따라 다른 스타일 적용:
+    // - source 없음 (룰베이스만): 속이 찬 작은 동그라미
+    // - source="ai" (AI만): 속이 빈 큰 동그라미
+    // - source="both" (룰베이스+AI): 속이 찬 작은 동그라미 + 속이 빈 큰 동그라미
+    function drawCircleMarker(ctx, cx, cy, size, color, mapped, isSelected, source) {
         ctx.save();
-        ctx.beginPath();
+        
         if (isSelected) {
             // 선택된 기둥은 더 크고 밝은 오랜지색 및 큰 하이라이트 효과
+            ctx.beginPath();
             ctx.arc(cx, cy, 7.5, 0, 2 * Math.PI);
             ctx.shadowColor = '#f47932';
             ctx.shadowBlur = 15;
@@ -2903,14 +2946,31 @@
             ctx.lineWidth = 1.5;
             ctx.stroke();
         } else {
-            ctx.arc(cx, cy, 4.5, 0, 2 * Math.PI);
-            ctx.shadowColor = color;
-            ctx.shadowBlur = mapped ? 4 : 8;
-            ctx.fillStyle = mapped ? color : '#ef4444';
-            ctx.fill();
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1.0;
-            ctx.stroke();
+            // AI 감지 표시: 속이 빈 큰 동그라미 (보라색 점선)
+            if (source === 'ai' || source === 'both') {
+                ctx.beginPath();
+                ctx.setLineDash([4, 3]); // 점선 패턴
+                ctx.arc(cx, cy, 10, 0, 2 * Math.PI);
+                ctx.strokeStyle = '#a855f7'; // 보라색
+                ctx.lineWidth = 2.0;
+                ctx.shadowColor = '#a855f7';
+                ctx.shadowBlur = 6;
+                ctx.stroke();
+                ctx.setLineDash([]); // 점선 해제
+            }
+            
+            // 룰베이스 감지 표시: 속이 찬 작은 동그라미
+            if (!source || source === 'both') {
+                ctx.beginPath();
+                ctx.arc(cx, cy, 4.5, 0, 2 * Math.PI);
+                ctx.shadowColor = color;
+                ctx.shadowBlur = mapped ? 4 : 8;
+                ctx.fillStyle = mapped ? color : '#ef4444';
+                ctx.fill();
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.0;
+                ctx.stroke();
+            }
         }
         ctx.restore();
     }
@@ -3058,7 +3118,7 @@
                     const cy = toCanvasY(col.cy);
                     const color = getMarkColor(col.text);
                     const isSelected = (selectedDetailElement && selectedDetailElement.id === col.id);
-                    drawCircleMarker(ctx, cx, cy, ibeamSize, color, !!col.height, isSelected);
+                    drawCircleMarker(ctx, cx, cy, ibeamSize, color, !!col.height, isSelected, col.source);
                 });
                 unmappedCols.forEach(col => {
                     const cx = toCanvasX(col.cx);
@@ -3143,7 +3203,7 @@
                     const cy = toCanvasY(bcy);
                     const color = getMarkColor(beam.text);
                     const isSelected = (selectedDetailElement && selectedDetailElement.id === beam.id);
-                    drawCircleMarker(ctx, cx, cy, ibeamSize, color, !!beam._corrected, isSelected);
+                    drawCircleMarker(ctx, cx, cy, ibeamSize, color, !!beam._corrected, isSelected, beam.source);
                 });
 
                 // HTML 클릭 영역 연동 (보 중앙부 배치)
@@ -3849,6 +3909,14 @@
     function saveToServerMetadata() {
         if (!globalFilename) return;
         
+        // 디버깅: source 필드 포함 여부 확인
+        const aiColumns = columns.filter(c => c.source === "ai");
+        const aiBeams = beams.filter(b => b.source === "ai");
+        console.log(`[DEBUG] 저장 시 AI 기둥: ${aiColumns.length}개, AI 보: ${aiBeams.length}개`);
+        if (aiColumns.length > 0) {
+            console.log("[DEBUG] AI 기둥 예시:", aiColumns.slice(0, 2).map(c => ({id: c.id, source: c.source})));
+        }
+        
         const payload = {
             filename: globalFilename,
             metadata: {
@@ -4104,12 +4172,34 @@
         }
     }
 
-    function showAddSheetModal(xmin, ymin, xmax, ymax) {
+    async function showAddSheetModal(xmin, ymin, xmax, ymax) {
         newSheetCoords = { xmin, ymin, xmax, ymax };
         const nextNum = sheets.filter(s => s.id.startsWith('manual_sheet_')).length + 1;
         document.getElementById('new-sheet-number').value = `S-M${String(nextNum).padStart(2, '0')}`;
         document.getElementById('new-sheet-name').value = `수동 시트구역 ${nextNum}`;
         document.getElementById('new-sheet-scale').value = selectedSheet ? (selectedSheet.scale || 150) : 150;
+        
+        // 도면명 자동 추출 시도
+        try {
+            const response = await fetch('/api/extract_sheet_name', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    filename: globalFilename,
+                    bbox: [xmin, ymin, xmax, ymax]
+                })
+            });
+            
+            if (response.ok) {
+                const data = await response.json();
+                if (data.suggested_name && data.suggested_name.length > 0) {
+                    document.getElementById('new-sheet-name').value = data.suggested_name;
+                    console.log(`[도면명 자동추천] ${data.suggested_name} (점수: ${data.score})`);
+                }
+            }
+        } catch (error) {
+            console.log('[도면명 자동추천] 실패:', error.message);
+        }
         
         document.getElementById('add-sheet-modal').style.display = 'flex';
     }
@@ -4469,9 +4559,16 @@
 
         item.status = 'approved';
         
+        console.log(`[DEBUG 승인] 타입: ${aiType}, 심볼: ${item.symbol}, ID: ${item.id}`);
+        
         if (aiType === 'column') {
-            const isDuplicate = columns.some(c => c.sheet_id === selectedSheet.id && Math.hypot(c.cx - item.cx, c.cy - item.cy) < 600.0);
-            if (!isDuplicate) {
+            const matchedCol = columns.find(c => c.sheet_id === selectedSheet.id && Math.hypot(c.cx - item.cx, c.cy - item.cy) < 600.0);
+            console.log(`[DEBUG 승인] 기둥 중복 체크: ${!!matchedCol}`);
+            if (matchedCol) {
+                // 기존 기둥과 매칭되면 source를 "both"로 업데이트
+                matchedCol.source = "both";
+                console.log(`[DEBUG 승인] 기둥 source 업데이트: ${item.symbol} → both`);
+            } else {
                 const maxColId = columns.reduce((max, c) => {
                     const num = parseInt(c.id.replace('col_', ''));
                     return num > max ? num : max;
@@ -4488,12 +4585,17 @@
                 });
             }
         } else if (aiType === 'beam') {
-            const isDuplicate = beams.some(b => b.sheet_id === selectedSheet.id && 
+            const matchedBeam = beams.find(b => b.sheet_id === selectedSheet.id &&
                 ((Math.hypot(b.start[0] - item.start[0], b.start[1] - item.start[1]) < 300 && Math.hypot(b.end[0] - item.end[0], b.end[1] - item.end[1]) < 300) ||
                  (Math.hypot(b.start[0] - item.end[0], b.start[1] - item.end[1]) < 300 && Math.hypot(b.end[0] - item.start[0], b.end[1] - item.start[1]) < 300))
             );
+            console.log(`[DEBUG 승인] 보 중복 체크: ${!!matchedBeam}`);
             
-            if (!isDuplicate) {
+            if (matchedBeam) {
+                // 기존 보와 매칭되면 source를 "both"로 업데이트
+                matchedBeam.source = "both";
+                console.log(`[DEBUG 승인] 보 source 업데이트: ${item.symbol} → both`);
+            } else {
                 const maxBeamId = beams.reduce((max, b) => {
                     const num = parseInt(b.id.replace('beam_', ''));
                     return num > max ? num : max;
@@ -4514,6 +4616,11 @@
         renderOverviewMap();
         if (activeSheet) {
             renderDetailSidebar(activeSheet);
+            if (activeSheet.job === 'column') {
+                renderDetailMemberListTable();
+            } else if (activeSheet.job === 'beam') {
+                renderBeamListTable(activeSheet);
+            }
         }
         
         if (activeFocusedAiId === id) activeFocusedAiId = null;
@@ -4543,14 +4650,24 @@
         const pendingItems = aiSuggestions.filter(s => s.status === 'pending');
         if (pendingItems.length === 0) return;
 
+        console.log(`[DEBUG 전체승인] 타입: ${aiType}, 대기 항목 수: ${pendingItems.length}`);
+
         let addedCount = 0;
+        let duplicateCount = 0;
 
         pendingItems.forEach(item => {
             item.status = 'approved';
             
             if (aiType === 'column') {
-                const isDuplicate = columns.some(c => c.sheet_id === selectedSheet.id && Math.hypot(c.cx - item.cx, c.cy - item.cy) < 600.0);
-                if (!isDuplicate) {
+                // 기존 기둥과 매칭되는지 확인 (600mm 이내)
+                const matchedCol = columns.find(c => c.sheet_id === selectedSheet.id && Math.hypot(c.cx - item.cx, c.cy - item.cy) < 600.0);
+                
+                if (matchedCol) {
+                    // 기존 기둥과 매칭되면 source를 "both"로 업데이트
+                    matchedCol.source = "both";
+                    console.log(`[DEBUG 전체승인] 기둥 source 업데이트: ${item.symbol} → both`);
+                    addedCount++;
+                } else {
                     const maxColId = columns.reduce((max, c) => {
                         const num = parseInt(c.id.replace('col_', ''));
                         return num > max ? num : max;
@@ -4568,12 +4685,19 @@
                     addedCount++;
                 }
             } else if (aiType === 'beam') {
-                const isDuplicate = beams.some(b => b.sheet_id === selectedSheet.id && 
+                // 기존 보와 매칭되는지 확인 (300mm 이내)
+                const matchedBeam = beams.find(b => b.sheet_id === selectedSheet.id &&
                     ((Math.hypot(b.start[0] - item.start[0], b.start[1] - item.start[1]) < 300 && Math.hypot(b.end[0] - item.end[0], b.end[1] - item.end[1]) < 300) ||
                      (Math.hypot(b.start[0] - item.end[0], b.start[1] - item.end[1]) < 300 && Math.hypot(b.end[0] - item.start[0], b.end[1] - item.start[1]) < 300))
                 );
                 
-                if (!isDuplicate) {
+                if (matchedBeam) {
+                    // 기존 보와 매칭되면 source를 "both"로 업데이트하고 AI 보는 추가하지 않음
+                    matchedBeam.source = "both";
+                    console.log(`[DEBUG 전체승인] 보 source 업데이트: ${item.symbol} → both (AI 보 추가 안함)`);
+                    addedCount++;
+                } else {
+                    // 매칭되지 않는 경우만 새로운 보 추가 (source: "ai")
                     const maxBeamId = beams.reduce((max, b) => {
                         const num = parseInt(b.id.replace('beam_', ''));
                         return num > max ? num : max;
@@ -4593,11 +4717,19 @@
             }
         });
 
+        console.log(`[DEBUG 전체승인] 추가: ${addedCount}개, 중복 제외: ${duplicateCount}개`);
+        console.log(`[DEBUG 전체승인] 현재 beams 수: ${beams.length}, source=ai 수: ${beams.filter(b => b.source === 'ai').length}`);
+
         closeAiSidebar();
         
         renderOverviewMap();
         if (activeSheet) {
             renderDetailSidebar(activeSheet);
+            if (activeSheet.job === 'column') {
+                renderDetailMemberListTable();
+            } else if (activeSheet.job === 'beam') {
+                renderBeamListTable(activeSheet);
+            }
         }
         
         saveToServerMetadata();
