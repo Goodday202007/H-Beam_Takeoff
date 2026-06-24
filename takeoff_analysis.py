@@ -2198,12 +2198,41 @@ def analyze_dxf_json(file_path):
                     val = int(txt_clean)
                     # 100~99999 범위의 값만 높이로 간주
                     if 100 <= val <= 99999:
+                        # 수직/수평 판별
+                        is_vertical = False
+                        is_horizontal = False
+                        defpoint = entity.dxf.get('defpoint', None)
+                        defpoint2 = entity.dxf.get('defpoint2', None)
+                        defpoint3 = entity.dxf.get('defpoint3', None)
+                        
+                        if defpoint2 and defpoint3:
+                            dx = abs(defpoint3[0] - defpoint2[0])
+                            dy = abs(defpoint3[1] - defpoint2[1])
+                            if dy > dx:
+                                is_vertical = True
+                            else:
+                                is_horizontal = True
+                        elif defpoint and defpoint2:
+                            dx = abs(defpoint2[0] - defpoint[0])
+                            dy = abs(defpoint2[1] - defpoint[1])
+                            if dy > dx:
+                                is_vertical = True
+                            else:
+                                is_horizontal = True
+                        
+                        direction = 'unknown'
+                        if is_vertical:
+                            direction = 'vertical'
+                        elif is_horizontal:
+                            direction = 'horizontal'
+
                         dimension_texts.append({
                             'text': dim_text,
                             'x': dim_x,
                             'y': dim_y,
                             'type': 'dimension',
-                            'color': dim_color
+                            'color': dim_color,
+                            'direction': direction
                         })
             
             # DIMENSION을 분해하여 가이드선 수집
@@ -2295,7 +2324,8 @@ def analyze_dxf_json(file_path):
                 'x': t['x'],
                 'y': t['y'],
                 'type': 'height_text',
-                'color': 0
+                'color': 0,
+                'direction': 'unknown'
             })
     
     # global_texts에 녹색 선과 높이 텍스트 정보 추가
@@ -2983,8 +3013,8 @@ def extract_dxf_data_for_ai(file_path: str, bbox: List[float]):
     msp = doc.modelspace()
     x_min, y_min, x_max, y_max = bbox
 
-    ai_texts = []
-    # 텍스트 추출
+    # 1. 일람표 파싱을 위한 전체 텍스트 수집
+    sheet_texts = []
     for entity in msp.query("TEXT MTEXT ATTRIB"):
         raw_txt = entity.dxf.text if entity.dxftype() != 'MTEXT' else entity.text
         if raw_txt:
@@ -2993,22 +3023,57 @@ def extract_dxf_data_for_ai(file_path: str, bbox: List[float]):
             if txt:
                 pos = entity.dxf.insert
                 if x_min <= pos.x <= x_max and y_min <= pos.y <= y_max:
-                    ai_texts.append({
+                    sheet_texts.append({
                         'text': txt,
-                        'x': round(pos.x, 2),
-                        'y': round(pos.y, 2),
+                        'x': pos.x,
+                        'y': pos.y,
+                        'rotation': entity.dxf.get('rotation', 0.0),
                         'layer': entity.dxf.layer
                     })
-
-    # 블록 텍스트 추출
+    
     block_texts = collect_insert_block_texts(doc, bbox)
     for bt in block_texts:
-        ai_texts.append({
+        sheet_texts.append({
             'text': bt['text'],
-            'x': round(bt['x'], 2),
-            'y': round(bt['y'], 2),
+            'x': bt['x'],
+            'y': bt['y'],
+            'rotation': bt.get('rotation', 0.0),
             'layer': bt.get('layer', 'INSERT_BLOCK')
         })
+
+    schedule_table = parse_sheet_table(sheet_texts, bbox)
+    schedule_keys = list(schedule_table.keys()) if schedule_table else []
+
+    def is_valuable_ai_text(txt_val: str) -> bool:
+        txt_clean = txt_val.strip()
+        if not txt_clean:
+            return False
+        # 1. 보 부호 또는 기둥 부호인 경우 무조건 포함
+        if BEAM_MARK_PATTERN.match(txt_clean) or is_column_mark(txt_clean) or is_beam_mark(txt_clean):
+            return True
+        # 2. 너무 긴 텍스트는 설명문이므로 제외
+        if len(txt_clean) > 25:
+            return False
+        # 3. 한글이 포함되어 있다면 주석이므로 제외
+        if re.search(r'[\uac00-\ud7a3]', txt_clean):
+            return False
+        # 4. 숫자와 알파벳이 둘 다 아예 없다면 특수기호이므로 제외
+        has_digit = any(c.isdigit() for c in txt_clean)
+        has_alpha = any(c.isalpha() for c in txt_clean)
+        if not has_digit and not has_alpha:
+            return False
+        return True
+
+    ai_texts = []
+    # 텍스트 추출 (is_valuable_ai_text 조건 부합하는 것만 선별)
+    for t in sheet_texts:
+        if is_valuable_ai_text(t['text']):
+            ai_texts.append({
+                'text': t['text'],
+                'x': round(t['x'], 2),
+                'y': round(t['y'], 2),
+                'layer': t.get('layer', '')
+            })
 
     # 기둥 후보 단면 (닫힌 폴리선 중 가로세로 100~1500mm 사이)
     column_candidates = []
@@ -3040,7 +3105,8 @@ def extract_dxf_data_for_ai(file_path: str, bbox: List[float]):
     # LINE에서 추출
     for entity in msp.query("LINE"):
         lyr = entity.dxf.layer.upper()
-        if any(kw in lyr for kw in beam_keywords) or lyr == "0":
+        # if any(kw in lyr for kw in beam_keywords) or lyr == "0":  # 0번 레이어의 무의미한 일반 선분 제외
+        if any(kw in lyr for kw in beam_keywords):  
             start = entity.dxf.start
             end = entity.dxf.end
             cx = (start.x + end.x) / 2.0
@@ -3082,7 +3148,8 @@ def extract_dxf_data_for_ai(file_path: str, bbox: List[float]):
     return {
         "texts": ai_texts,
         "column_candidates": column_candidates,
-        "beam_candidates": beam_candidates
+        "beam_candidates": beam_candidates,
+        "schedule_table": schedule_keys
     }
 
 def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
@@ -3156,18 +3223,19 @@ def extract_height_texts_for_ai(file_path: str, bbox: List[float]):
                     if is_candidate:
                         # 근처 Defpoints 선의 방향 확인
                         direction = _find_nearby_defpoints_direction(pos.x, pos.y, defpoints_lines)
-                        height_texts.append({
-                            'text': txt,
-                            'x': round(pos.x, 2),
-                            'y': round(pos.y, 2),
-                            'layer': entity.dxf.layer,
-                            'direction': direction
-                        })
+                        if direction != 'horizontal':  # 수평 방향 일반 텍스트는 제외
+                            height_texts.append({
+                                'text': txt,
+                                'x': round(pos.x, 2),
+                                'y': round(pos.y, 2),
+                                'layer': entity.dxf.layer,
+                                'direction': direction
+                            })
 
     # 2. DIMENSION 엔티티로부터 값 추출 (수직선만)
     for entity in msp.query("DIMENSION"):
         try:
-            txt = entity.dxf.get('text_override', '').strip()
+            txt = entity.dxf.get('text', '').strip()  # text_override -> text
             val = entity.dxf.get('actual_measurement', 0.0)
             
             if not txt and val > 0.0:

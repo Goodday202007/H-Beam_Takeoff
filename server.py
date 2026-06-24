@@ -1442,7 +1442,7 @@ async def ai_analyze_columns(request: AiHelperRequest):
         "2. 도면 작성자가 기둥 텍스트를 기둥 단면 기하로부터 멀리(3,600mm 초과) 배치했을 가능성(Offset)을 염두에 두라. 그리드 축 정렬이나 대칭적인 기둥 간격 흐름을 파악하여, 거리가 기준을 다소 초과하더라도 구조적 맥락상 확실한 기둥이라면 올바르게 매칭을 승인하라.\n"
         "3. 기둥 단면이 닫힌 폴리선이 아니거나 분절된 다수의 라인으로 엉성하게 그려진 경우라도, H빔 단면 모양(가로세로 100~1500mm 스케일)을 이루고 있다면 적극적으로 기둥 중심 좌표를 산출하여 기둥으로 매칭하라.\n"
         "4. 규칙 기반 알고리즘이 누락한(놓친) 기둥 단면이 있다면, DXF 데이터 상에서 적절한 기둥 텍스트를 찾아 새로 기둥으로 추가하라.\n"
-        "5. 반드시 일람표(Schedule Table)에 명시되었거나 기존 기둥 리스트에 언급되었던 유효한 기둥 부호(symbol)만을 사용해야 한다. 존재하지 않는 임의의 부호를 새로 만들어내지 마라.\n"
+        "5. **중요**: 반드시 제공된 DXF 데이터 내 'schedule_table' 리스트에 존재하는 유효한 기둥 부호(symbol)만을 기둥 분석 및 매칭 결과에 포함해야 한다. 만약 어떤 기둥 부호(예: SC1)가 도면 텍스트에 나타나 있더라도, 'schedule_table' 리스트에 존재하지 않는다면(예: B로 시작하는 비H빔 규격 등을 가져 제외된 부호 등) 기둥 매칭 제안 목록(ai_columns)에서 절대적으로 배제(제외)해야 한다. 존재하지 않는 임의의 부호를 새로 만들어내지 마라.\n"
         "6. 분석 결과는 반드시 JSON 포맷으로만 응답하라. 마크다운 기호(```json 등)나 기타 부연설명은 절대 포함하지 말고 순수 JSON만 응답해야 한다.\n\n"
         "7. **중요**: 반환하는 cx, cy 좌표는 반드시 'column_candidates' 배열에 있는 기둥 단면(I자 형상 폴리선)의 중심 좌표여야 한다. 기둥 부호 텍스트(SC2, MC1 등)의 좌표를 반환하면 안 된다. 기둥 부호 텍스트는 기둥 단면과 떨어져 있을 수 있으므로, 텍스트 좌표가 아닌 실제 기둥 단면의 중심 좌표를 사용하라.\n\n"
         "반환 형식:\n"
@@ -1541,7 +1541,7 @@ async def ai_analyze_beams(request: AiHelperRequest):
         "2. 도면 작성자가 보 부호 텍스트를 보 기하선으로부터 멀리(4,000mm 초과) 배치하거나 텍스트 정렬 각도가 약간 틀어졌을 가능성을 염두에 두라. 구조적 연결성 및 그리드 맥락상 확실하게 일치하는 쌍이라면 거리가 기준을 다소 초과하더라도 유연하게 매칭을 승인하라.\n"
         "3. 보 기하선이 하나의 단일 선분으로 정의되지 않고 여러 조각(LINE)으로 분절되어 있어도, 연장선 상에서 하나의 보 흐름을 이루고 있다면 이를 결합하고 최종 시작점과 끝점을 추론하여 매칭하라.\n"
         "4. 규칙 기반 알고리즘이 누락한(놓친) 보가 존재한다면, DXF 데이터 상에서 적절한 보 텍스트와 기하선을 찾아 새로 보로 추가하라.\n"
-        "5. 반드시 일람표(Schedule Table)에 명시되었거나 기존 보 리스트에 언급되었던 유효한 보 부호(symbol)만을 사용해야 한다. 존재하지 않는 임의의 부호를 새로 만들어내지 마라.\n"
+        "5. **중요**: 반드시 제공된 DXF 데이터 내 'schedule_table' 리스트에 존재하는 유효한 보 부호(symbol)만을 보 분석 및 매칭 결과에 포함해야 한다. 만약 어떤 보 부호가 도면 텍스트에 나타나 있더라도, 'schedule_table' 리스트에 존재하지 않는다면 보 매칭 제안 목록(ai_beams)에서 절대적으로 배제(제외)해야 한다. 존재하지 않는 임의의 부호를 새로 만들어내지 마라.\n"
         "6. 분석 결과는 반드시 JSON 포맷으로만 응답하라. 마크다운 기호(```json 등)나 기타 부연설명은 절대 포함하지 말고 순수 JSON만 응답해야 한다.\n\n"
         "반환 형식:\n"
         "{\n"
@@ -1577,7 +1577,7 @@ async def ai_analyze_beams(request: AiHelperRequest):
     payload = sanitize_surrogates(payload)
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:  # 60 -> 120
             response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
             if response.status_code != 200:
                 raise HTTPException(status_code=response.status_code, detail=f"OpenRouter API error: {response.text}")
@@ -1635,7 +1635,34 @@ async def ai_recommend_height(request: AiHeightRequest):
 
     try:
         if request.texts is not None:
-            height_texts = request.texts
+            # 백엔드 자체 수직선 추출기와 크로스 체크하여 치수선 타입(dimension)의 수직선 여부를 실시간 검증
+            real_verticals = extract_height_texts_for_ai(file_path, target_bbox)
+            if isinstance(real_verticals, dict) and "error" in real_verticals:
+                real_verticals = []
+            
+            vertical_coords = set()
+            for rv in real_verticals:
+                vertical_coords.add((round(rv['x']/10)*10, round(rv['y']/10)*10))
+            
+            height_texts = []
+            for t in request.texts:
+                t_direction = t.get('direction', 'unknown')
+                t_type = t.get('type', '')
+                
+                if t_direction == 'horizontal':
+                    continue
+                
+                if t_type == 'dimension':
+                    # 좌표 기반 검증
+                    tx = float(t.get('x', 0))
+                    ty = float(t.get('y', 0))
+                    key = (round(tx/10)*10, round(ty/10)*10)
+                    if key in vertical_coords:
+                        t['direction'] = 'vertical'
+                        height_texts.append(t)
+                else:
+                    # 일반 텍스트는 그대로 전달
+                    height_texts.append(t)
         else:
             height_texts = extract_height_texts_for_ai(file_path, target_bbox)
             if isinstance(height_texts, dict) and "error" in height_texts:
